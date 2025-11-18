@@ -37,7 +37,7 @@ def load_data():
     """Charge les données enrichies."""
     print("📊 Chargement des données enrichies...")
 
-    enriched_file = Path('data/processed/commandes_enriched.csv')
+    enriched_file = Path('../data/processed/commandes_enriched.csv')
 
     if not enriched_file.exists():
         print(f"❌ Fichier non trouvé : {enriched_file}")

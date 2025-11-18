@@ -11,7 +11,8 @@ from .config import (
     WEEKDAY_NAMES,
     WEEKEND_DAYS,
     get_training_date_range,
-    get_file_path
+    get_file_path,
+    DataSourceConfig
 )
 
 __all__ = [
@@ -22,5 +23,6 @@ __all__ = [
     'WEEKDAY_NAMES',
     'WEEKEND_DAYS',
     'get_training_date_range',
-    'get_file_path'
+    'get_file_path',
+    'DataSourceConfig'
 ]

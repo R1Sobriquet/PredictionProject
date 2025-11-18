@@ -1,6 +1,12 @@
 """
 Module d'ingestion et de nettoyage des données de commandes.
 
+NOUVEAU : Support hybride pour charger depuis :
+- CSV (mode legacy)
+- SQL Server (mode recommandé)
+
+La source est configurée dans le fichier .env (DATA_SOURCE=csv ou sqlserver)
+
 Ce module implémente l'étape 1 du projet :
 - Récupération des données 2024 (sauf décembre)
 - Nettoyage des données (doublons, valeurs aberrantes)
@@ -19,17 +25,21 @@ try:
         ColumnNames,
         ValidationRules,
         Messages,
+        DataSourceConfig,
         get_training_date_range,
         get_file_path
     )
+    from .database_connector import SQLServerConnector
 except ImportError:
     from src.utils import (
         ColumnNames,
         ValidationRules,
         Messages,
+        DataSourceConfig,
         get_training_date_range,
         get_file_path
     )
+    from src.database_connector import SQLServerConnector
 
 # Configuration du logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -40,21 +50,44 @@ class DataIngestionPipeline:
     """
     Pipeline d'ingestion et de nettoyage des données de commandes.
 
+    Support hybride :
+    - CSV : charge depuis un fichier CSV local
+    - SQL Server : charge directement depuis la base de données
+
     Processus :
-    1. Chargement des données brutes
+    1. Chargement des données brutes (CSV ou SQL Server)
     2. Validation et nettoyage
     3. Agrégation par jour/article
     4. Ajout des jours/articles manquants avec quantité 0
     """
 
-    def __init__(self, source_file_path: Optional[Path] = None):
+    def __init__(
+        self,
+        source_file_path: Optional[Path] = None,
+        data_source: Optional[str] = None,
+        db_connector: Optional[SQLServerConnector] = None
+    ):
         """
         Initialise le pipeline d'ingestion.
 
         Args:
-            source_file_path: Chemin vers le fichier source (optionnel)
+            source_file_path: Chemin vers le fichier CSV (si mode CSV)
+            data_source: Source de données ('csv' ou 'sqlserver'). Si None, utilise la config.
+            db_connector: Connecteur SQL Server (optionnel, créé automatiquement si besoin)
         """
-        self.source_file_path = source_file_path or get_file_path('raw')
+        # Déterminer la source de données
+        self.data_source = data_source or DataSourceConfig.DEFAULT_SOURCE
+
+        # Configuration selon la source
+        if self.data_source == 'sqlserver':
+            self.db_connector = db_connector or SQLServerConnector()
+            self.source_file_path = None
+            logger.info(f"📊 Mode SQL Server : {DataSourceConfig.DB_SERVER} / {DataSourceConfig.DB_NAME}")
+        else:
+            self.source_file_path = source_file_path or get_file_path('raw')
+            self.db_connector = None
+            logger.info(f"📁 Mode CSV : {self.source_file_path}")
+
         self.training_start, self.training_end = get_training_date_range()
         self.raw_data = None
         self.clean_data = None
@@ -62,16 +95,29 @@ class DataIngestionPipeline:
 
     def load_raw_data(self) -> pd.DataFrame:
         """
-        Charge les données brutes depuis le fichier source.
+        Charge les données brutes depuis la source configurée (CSV ou SQL Server).
 
         Returns:
             DataFrame: Données brutes chargées
 
         Raises:
-            FileNotFoundError: Si le fichier source n'existe pas
+            FileNotFoundError: Si le fichier source n'existe pas (mode CSV)
+            ConnectionError: Si la connexion SQL Server échoue (mode SQL Server)
             ValueError: Si le fichier est vide ou mal formaté
         """
-        logger.info(f"Chargement des données depuis : {self.source_file_path}")
+        if self.data_source == 'sqlserver':
+            return self._load_from_sqlserver()
+        else:
+            return self._load_from_csv()
+
+    def _load_from_csv(self) -> pd.DataFrame:
+        """
+        Charge les données depuis un fichier CSV.
+
+        Returns:
+            DataFrame: Données brutes depuis CSV
+        """
+        logger.info(f"📁 Chargement des données CSV depuis : {self.source_file_path}")
 
         if not self.source_file_path.exists():
             raise FileNotFoundError(f"{Messages.ERROR_FILE_NOT_FOUND}: {self.source_file_path}")
@@ -88,12 +134,39 @@ class DataIngestionPipeline:
             if self.raw_data.empty:
                 raise ValueError(Messages.ERROR_NO_DATA)
 
-            logger.info(f"{Messages.DATA_LOADED} - {len(self.raw_data)} lignes")
+            logger.info(f"{Messages.DATA_LOADED} - {len(self.raw_data)} lignes (CSV)")
             return self.raw_data
 
         except Exception as e:
-            logger.error(f"Erreur lors du chargement : {e}")
+            logger.error(f"Erreur lors du chargement CSV : {e}")
             raise
+
+    def _load_from_sqlserver(self) -> pd.DataFrame:
+        """
+        Charge les données depuis SQL Server.
+
+        Returns:
+            DataFrame: Données brutes depuis SQL Server
+        """
+        logger.info(f"🗄️  Chargement des données depuis SQL Server...")
+
+        try:
+            # Connexion et récupération des données
+            # On filtre déjà par date au niveau SQL pour optimiser
+            self.raw_data = self.db_connector.fetch_commandes_data(
+                start_date=None,  # On prend tout, on filtrera après
+                end_date=None
+            )
+
+            if self.raw_data.empty:
+                raise ValueError(Messages.ERROR_NO_DATA)
+
+            logger.info(f"{Messages.DATA_LOADED} - {len(self.raw_data)} lignes (SQL Server)")
+            return self.raw_data
+
+        except Exception as e:
+            logger.error(f"{Messages.ERROR_DB_CONNECTION}: {e}")
+            raise ConnectionError(f"Impossible de charger depuis SQL Server : {e}")
 
     def standardize_columns(self) -> pd.DataFrame:
         """
@@ -130,12 +203,26 @@ class DataIngestionPipeline:
         """
         initial_count = len(self.raw_data)
 
-        # Filtrage par date
-        mask = (
-            (self.raw_data[ColumnNames.DATE] >= self.training_start) &
-            (self.raw_data[ColumnNames.DATE] <= self.training_end)
-        )
+        # Assurer que la colonne DATE est en datetime64 (sans heure)
+        # Ceci évite les problèmes de comparaison datetime.datetime vs datetime.date
+        self.raw_data[ColumnNames.DATE] = pd.to_datetime(self.raw_data[ColumnNames.DATE]).dt.normalize()
 
+        # Convertir les dates de training en Timestamp pandas pour comparaison cohérente
+        training_start_ts = pd.Timestamp(self.training_start.date())
+        training_end_ts = pd.Timestamp(self.training_end.date())
+
+        # Filtrage par date
+        # Normaliser les dates (enlever heures/minutes)
+        self.raw_data[ColumnNames.DATE] = pd.to_datetime(self.raw_data[ColumnNames.DATE]).dt.normalize()
+
+        # Convertir en Timestamp pandas pour comparaison cohérente
+        training_start_ts = pd.Timestamp(self.training_start.date())
+        training_end_ts = pd.Timestamp(self.training_end.date())
+
+        mask = (
+                (self.raw_data[ColumnNames.DATE] >= training_start_ts) &
+                (self.raw_data[ColumnNames.DATE] <= training_end_ts)
+        )
         self.raw_data = self.raw_data[mask].copy()
         filtered_count = len(self.raw_data)
 
@@ -301,6 +388,7 @@ class DataIngestionPipeline:
         """
         logger.info("🚀 DÉBUT DU PIPELINE D'INGESTION")
         logger.info("=" * 50)
+        logger.info(f"📊 Source de données : {self.data_source.upper()}")
 
         try:
             # Étapes du pipeline
@@ -322,6 +410,10 @@ class DataIngestionPipeline:
         except Exception as e:
             logger.error(f"❌ ERREUR DANS LE PIPELINE : {e}")
             raise
+        finally:
+            # Fermer la connexion SQL Server si elle existe
+            if self.db_connector and self.db_connector.connection:
+                self.db_connector.disconnect()
 
     def get_data_summary(self) -> dict:
         """
@@ -334,6 +426,7 @@ class DataIngestionPipeline:
             return {"error": "Aucune donnée disponible"}
 
         return {
+            "data_source": self.data_source,
             "total_lines": len(self.final_data),
             "unique_dates": self.final_data[ColumnNames.DATE].nunique(),
             "unique_articles": self.final_data[ColumnNames.ARTICLE_ID].nunique(),
@@ -348,23 +441,28 @@ class DataIngestionPipeline:
 
 # ===== FONCTIONS UTILITAIRES =====
 
-def quick_data_ingestion(source_file: str) -> pd.DataFrame:
+def quick_data_ingestion(
+    source: str = None,
+    source_file: Optional[str] = None
+) -> pd.DataFrame:
     """
     Fonction rapide pour l'ingestion complète des données.
 
     Args:
-        source_file: Chemin vers le fichier source
+        source: 'csv' ou 'sqlserver' (si None, utilise la config)
+        source_file: Chemin vers le fichier source (si mode CSV)
 
     Returns:
         DataFrame: Données prêtes pour l'analyse
     """
-    pipeline = DataIngestionPipeline(Path(source_file))
+    source_path = Path(source_file) if source_file else None
+    pipeline = DataIngestionPipeline(source_path, data_source=source)
     return pipeline.run_full_pipeline()
 
 
 def preview_raw_data(file_path: Path, n_rows: int = 10) -> None:
     """
-    Affiche un aperçu des données brutes.
+    Affiche un aperçu des données brutes (CSV uniquement).
 
     Args:
         file_path: Chemin vers le fichier
@@ -385,13 +483,29 @@ def preview_raw_data(file_path: Path, n_rows: int = 10) -> None:
 
 if __name__ == "__main__":
     # Test du pipeline si exécuté directement
+    print("="*60)
+    print("🧪 TEST DU PIPELINE D'INGESTION")
+    print("="*60)
+
+    # Afficher la source configurée
+    from src.utils.config import print_data_source_info
+    print_data_source_info()
+
+    print("\n🚀 Lancement du pipeline...")
+
     pipeline = DataIngestionPipeline()
     try:
         data = pipeline.run_full_pipeline()
         summary = pipeline.get_data_summary()
+
         print("\n📊 RÉSUMÉ DES DONNÉES :")
         for key, value in summary.items():
             print(f"   {key}: {value}")
+
     except Exception as e:
-        print(f"Erreur : {e}")
-        print("Assurez-vous que le fichier source existe dans data/raw/")
+        print(f"\n❌ Erreur : {e}")
+        print("\n💡 Vérifications :")
+        print("   1. Le fichier .env existe avec les bonnes valeurs")
+        print("   2. DATA_SOURCE est 'csv' ou 'sqlserver'")
+        print("   3. Si SQL Server : les credentials sont corrects")
+        print("   4. Si CSV : le fichier existe dans data/raw/")

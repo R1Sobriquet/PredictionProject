@@ -1,11 +1,21 @@
 """
 Configuration centrale du projet de prévision de commandes.
 Ce fichier centralise tous les paramètres pour faciliter la maintenance.
+
+NOUVEAU : Support de SQL Server pour charger les données directement depuis la base.
 """
 
 from datetime import datetime
 from pathlib import Path
 from typing import List
+import os
+
+# Charger les variables d'environnement depuis .env
+try:
+    from dotenv import load_dotenv
+    load_dotenv()  # Charge automatiquement le fichier .env
+except ImportError:
+    pass  # python-dotenv optionnel
 
 # ===== CHEMINS DE FICHIERS =====
 PROJECT_ROOT = Path(__file__).parent.parent.parent
@@ -24,6 +34,56 @@ CLEAN_DATA_FILE = "commandes_clean.csv"
 ENRICHED_DATA_FILE = "commandes_enriched.csv"
 PREDICTIONS_FILE = "predictions_2025.csv"
 
+# ===== CONFIGURATION SOURCE DE DONNÉES =====
+class DataSourceConfig:
+    """Configuration de la source de données (CSV ou SQL Server)"""
+
+    # Source par défaut (peut être surchargée par .env)
+    # Valeurs possibles : 'csv' ou 'sqlserver'
+    DEFAULT_SOURCE = os.getenv('DATA_SOURCE', 'csv').lower()
+
+    # Pour CSV
+    CSV_FILE_PATH = os.getenv('CSV_FILE_PATH', str(DATA_RAW_DIR / RAW_DATA_FILE))
+
+    # Pour SQL Server
+    DB_SERVER = os.getenv('DB_SERVER', '10.147.18.196')
+    DB_NAME = os.getenv('DB_NAME', 'Python')
+    DB_USER = os.getenv('DB_USER', 'sa')
+    DB_PASSWORD = os.getenv('DB_PASSWORD', '')
+    DB_DRIVER = os.getenv('DB_DRIVER', 'ODBC Driver 17 for SQL Server')
+    DB_TIMEOUT = int(os.getenv('DB_TIMEOUT', '30'))
+    DB_DEBUG = os.getenv('DB_DEBUG', 'False').lower() == 'true'
+
+    # Table SQL Server
+    DB_TABLE = 'dbo.ligne_commande'
+
+    @classmethod
+    def is_sqlserver(cls) -> bool:
+        """Vérifie si on utilise SQL Server comme source."""
+        return cls.DEFAULT_SOURCE == 'sqlserver'
+
+    @classmethod
+    def is_csv(cls) -> bool:
+        """Vérifie si on utilise CSV comme source."""
+        return cls.DEFAULT_SOURCE == 'csv'
+
+    @classmethod
+    def get_source_info(cls) -> dict:
+        """Retourne les infos sur la source de données configurée."""
+        if cls.is_sqlserver():
+            return {
+                'type': 'SQL Server',
+                'server': cls.DB_SERVER,
+                'database': cls.DB_NAME,
+                'table': cls.DB_TABLE,
+                'user': cls.DB_USER
+            }
+        else:
+            return {
+                'type': 'CSV',
+                'path': cls.CSV_FILE_PATH
+            }
+
 # ===== PARAMÈTRES TEMPORELS =====
 # Année de référence pour l'entraînement
 TRAINING_YEAR = 2024
@@ -35,9 +95,6 @@ EXCLUDED_MONTHS = [12]  # Décembre
 PREDICTION_YEAR = 2025
 
 # Format de date dans les fichiers source
-
-
-
 DATE_FORMAT = "%Y-%m-%d"
 
 
@@ -45,11 +102,18 @@ DATE_FORMAT = "%Y-%m-%d"
 class ColumnNames:
     """Noms des colonnes dans la table source et leurs équivalents standardisés"""
 
-    # Colonnes source (à adapter selon vos données)
+    # Colonnes source SQL Server (table dbo.ligne_commande)
     SOURCE_DATE = "date_ligne_commande"
     SOURCE_ARTICLE_ID = "id_article"
     SOURCE_ARTICLE_REF = "ref_article"
     SOURCE_QUANTITY = "quantite"
+
+    # Colonnes additionnelles dans SQL Server (non utilisées pour l'instant)
+    SOURCE_CLIENT_ID = "id_client"
+    SOURCE_MONTANT_UNITAIRE = "montant_unitaire"
+    SOURCE_TVA = "tva"
+    SOURCE_TOTAL_HT = "total_ht"
+    SOURCE_TOTAL_TTC = "total_ttc"
 
     # Colonnes standardisées (utilisées dans le code)
     DATE = "date"
@@ -129,6 +193,7 @@ class Messages:
     ERROR_INVALID_DATE = "❌ Format de date invalide"
     ERROR_INVALID_QUANTITY = "❌ Quantité invalide détectée"
     ERROR_NO_DATA = "❌ Aucune donnée trouvée"
+    ERROR_DB_CONNECTION = "❌ Erreur de connexion à la base de données"
 
 
 # ===== FONCTION UTILITAIRE =====
@@ -162,3 +227,36 @@ def get_file_path(file_type: str) -> Path:
     }
 
     return file_mapping.get(file_type, DATA_RAW_DIR / RAW_DATA_FILE)
+
+
+def print_data_source_info():
+    """Affiche les informations sur la source de données configurée."""
+    info = DataSourceConfig.get_source_info()
+
+    print("=" * 60)
+    print("📊 CONFIGURATION DE LA SOURCE DE DONNÉES")
+    print("=" * 60)
+
+    if info['type'] == 'SQL Server':
+        print(f"Type : {info['type']}")
+        print(f"Serveur : {info['server']}")
+        print(f"Base : {info['database']}")
+        print(f"Table : {info['table']}")
+        print(f"Utilisateur : {info['user']}")
+    else:
+        print(f"Type : {info['type']}")
+        print(f"Chemin : {info['path']}")
+
+    print("=" * 60)
+
+
+# Test du module si exécuté directement
+if __name__ == "__main__":
+    print("🧪 Test de la configuration")
+    print_data_source_info()
+
+    print("\n📁 Chemins des fichiers :")
+    for file_type in ['raw', 'clean', 'enriched', 'output']:
+        print(f"   {file_type}: {get_file_path(file_type)}")
+
+    print("\n✅ Configuration chargée avec succès")
