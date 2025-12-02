@@ -361,33 +361,90 @@ class DataEnrichmentPipeline:
 
         return output_path
 
-    def run_full_enrichment(self, save_output: bool = True) -> pd.DataFrame:
+    def save_intermediate_snapshot(self, data: pd.DataFrame, stage_name: str) -> Path:
+        """
+        Sauvegarde un snapshot intermédiaire du pipeline d'enrichissement.
+
+        Args:
+            data: DataFrame à sauvegarder
+            stage_name: Nom de l'étape (ex: 'temporal', 'lag', 'rolling', etc.)
+
+        Returns:
+            Path: Chemin du fichier sauvegardé
+        """
+        # Créer le dossier snapshots s'il n'existe pas
+        snapshot_dir = Path("data/snapshots")
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+        # Nom du fichier
+        snapshot_file = snapshot_dir / f"snapshot_enrichment_{stage_name}.csv"
+
+        # Sauvegarder
+        data.to_csv(snapshot_file, index=False, date_format='%Y-%m-%d')
+        logger.info(f"   📸 Snapshot sauvegardé : {snapshot_file} ({len(data)} lignes)")
+
+        return snapshot_file
+
+    def run_full_enrichment(self, save_output: bool = True, save_snapshots: bool = True) -> pd.DataFrame:
         """
         Exécute le pipeline complet d'enrichissement.
 
         Args:
-            save_output: Sauvegarde automatique des résultats
+            save_output: Sauvegarde automatique du résultat final
+            save_snapshots: Sauvegarde des CSV intermédiaires à chaque étape
 
         Returns:
             DataFrame: Données enrichies complètes
         """
         logger.info("🚀 DÉBUT DU PIPELINE D'ENRICHISSEMENT")
         logger.info("=" * 50)
-        try:
-            # Pipeline d'enrichissement
-            self.load_clean_data()
-            self.add_temporal_features()
-            self.add_lag_features(lag_days=[1, 7])  # Jour précédent + semaine précédente
-            self.add_rolling_features(windows=[7, 30])  # Moyennes 7 et 30 jours
-            self.add_seasonal_features()
 
+        if save_snapshots:
+            logger.info("📸 Mode snapshots activé - CSV intermédiaires seront sauvegardés")
+
+        try:
+            # ÉTAPE 1 : Chargement
+            logger.info("\n🔄 ÉTAPE 1 : Chargement des données nettoyées...")
+            self.load_clean_data()
+            if save_snapshots:
+                self.save_intermediate_snapshot(self.clean_data, "01_loaded")
+
+            # ÉTAPE 2 : Variables temporelles
+            logger.info("\n🔄 ÉTAPE 2: Ajout des variables temporelles...")
+            self.add_temporal_features()
+            if save_snapshots:
+                self.save_intermediate_snapshot(self.enriched_data, "02_temporal")
+
+            # ÉTAPE 3 : Variables de retard
+            logger.info("\n🔄 ÉTAPE 3 : Ajout des variables de retard...")
+            self.add_lag_features(lag_days=[1, 7])
+            if save_snapshots:
+                self.save_intermediate_snapshot(self.enriched_data, "03_lag")
+
+            # ÉTAPE 4 : Moyennes mobiles
+            logger.info("\n🔄 ÉTAPE 4 : Ajout des moyennes mobiles...")
+            self.add_rolling_features(windows=[7, 30])
+            if save_snapshots:
+                self.save_intermediate_snapshot(self.enriched_data, "04_rolling")
+
+            # ÉTAPE 5 : Variables saisonnières
+            logger.info("\n🔄 ÉTAPE 5 : Ajout des variables saisonnières...")
+            self.add_seasonal_features()
+            if save_snapshots:
+                self.save_intermediate_snapshot(self.enriched_data, "05_seasonal")
+
+            # ÉTAPE 6 : Sauvegarde finale
             if save_output:
+                logger.info("\n🔄 ÉTAPE 6 : Sauvegarde finale...")
                 self.save_enriched_data()
 
             logger.info("=" * 50)
             logger.info("✅ PIPELINE D'ENRICHISSEMENT TERMINÉ AVEC SUCCÈS")
             logger.info(f"   📊 {len(self.enriched_data)} lignes enrichies")
             logger.info(f"   📈 {len(self.enriched_data.columns)} colonnes au total")
+
+            if save_snapshots:
+                logger.info("📸 Snapshots disponibles dans : data/snapshots/")
 
             return self.enriched_data
 

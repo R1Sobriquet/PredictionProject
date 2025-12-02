@@ -212,17 +212,11 @@ class DataIngestionPipeline:
         training_end_ts = pd.Timestamp(self.training_end.date())
 
         # Filtrage par date
-        # Normaliser les dates (enlever heures/minutes)
-        self.raw_data[ColumnNames.DATE] = pd.to_datetime(self.raw_data[ColumnNames.DATE]).dt.normalize()
-
-        # Convertir en Timestamp pandas pour comparaison cohérente
-        training_start_ts = pd.Timestamp(self.training_start.date())
-        training_end_ts = pd.Timestamp(self.training_end.date())
-
         mask = (
-                (self.raw_data[ColumnNames.DATE] >= training_start_ts) &
-                (self.raw_data[ColumnNames.DATE] <= training_end_ts)
+            (self.raw_data[ColumnNames.DATE] >= training_start_ts) &
+            (self.raw_data[ColumnNames.DATE] <= training_end_ts)
         )
+
         self.raw_data = self.raw_data[mask].copy()
         filtered_count = len(self.raw_data)
 
@@ -379,9 +373,38 @@ class DataIngestionPipeline:
 
         return output_path
 
-    def run_full_pipeline(self) -> pd.DataFrame:
+    def save_intermediate_snapshot(self, data: pd.DataFrame, stage_name: str) -> Path:
+        """
+        Sauvegarde un snapshot intermédiaire du pipeline.
+
+        Args:
+            data: DataFrame à sauvegarder
+            stage_name: Nom de l'étape (ex: 'raw', 'standardized', 'filtered', etc.)
+
+        Returns:
+            Path: Chemin du fichier sauvegardé
+        """
+        # Créer le dossier snapshots s'il n'existe pas
+        snapshot_dir = Path("data/snapshots")
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+        # Nom du fichier avec timestamp
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        snapshot_file = snapshot_dir / f"snapshot_{stage_name}.csv"
+
+        # Sauvegarder
+        data.to_csv(snapshot_file, index=False, date_format='%Y-%m-%d')
+        logger.info(f"   📸 Snapshot sauvegardé : {snapshot_file} ({len(data)} lignes)")
+
+        return snapshot_file
+
+    def run_full_pipeline(self, save_snapshots: bool = True) -> pd.DataFrame:
         """
         Exécute le pipeline complet d'ingestion et de nettoyage.
+
+        Args:
+            save_snapshots: Si True, sauvegarde des CSV intermédiaires à chaque étape
 
         Returns:
             DataFrame: Données finales nettoyées et complétées
@@ -390,20 +413,55 @@ class DataIngestionPipeline:
         logger.info("=" * 50)
         logger.info(f"📊 Source de données : {self.data_source.upper()}")
 
-        try:
-            # Étapes du pipeline
-            self.load_raw_data()
-            self.standardize_columns()
-            self.filter_training_period()
-            self.validate_and_clean_data()
-            self.aggregate_daily_data()
-            self.fill_missing_combinations()
+        if save_snapshots:
+            logger.info("📸 Mode snapshots activé - CSV intermédiaires seront sauvegardés")
 
-            # Sauvegarde
+        try:
+            # ÉTAPE 1 : Chargement des données brutes
+            logger.info("\n🔄 ÉTAPE 1 : Chargement des données brutes...")
+            self.load_raw_data()
+            if save_snapshots:
+                self.save_intermediate_snapshot(self.raw_data, "01_raw_loaded")
+
+            # ÉTAPE 2 : Standardisation des colonnes
+            logger.info("\n🔄 ÉTAPE 2 : Standardisation des colonnes...")
+            self.standardize_columns()
+            if save_snapshots:
+                self.save_intermediate_snapshot(self.raw_data, "02_standardized")
+
+            # ÉTAPE 3 : Filtrage de la période d'entraînement
+            logger.info("\n🔄 ÉTAPE 3 : Filtrage de la période d'entraînement...")
+            self.filter_training_period()
+            if save_snapshots:
+                self.save_intermediate_snapshot(self.raw_data, "03_filtered")
+
+            # ÉTAPE 4 : Validation et nettoyage
+            logger.info("\n🔄 ÉTAPE 4 : Validation et nettoyage...")
+            self.validate_and_clean_data()
+            if save_snapshots:
+                self.save_intermediate_snapshot(self.raw_data, "04_cleaned")
+
+            # ÉTAPE 5 : Agrégation quotidienne
+            logger.info("\n🔄 ÉTAPE 5 : Agrégation quotidienne...")
+            self.aggregate_daily_data()
+            if save_snapshots:
+                self.save_intermediate_snapshot(self.clean_data, "05_aggregated")
+
+            # ÉTAPE 6 : Remplissage des combinaisons manquantes
+            logger.info("\n🔄 ÉTAPE 6 : Remplissage des combinaisons manquantes...")
+            self.fill_missing_combinations()
+            if save_snapshots:
+                self.save_intermediate_snapshot(self.final_data, "06_filled")
+
+            # Sauvegarde finale
+            logger.info("\n🔄 ÉTAPE 7 : Sauvegarde finale...")
             self.save_clean_data()
 
             logger.info("=" * 50)
             logger.info("✅ PIPELINE D'INGESTION TERMINÉ AVEC SUCCÈS")
+
+            if save_snapshots:
+                logger.info("📸 Snapshots disponibles dans : data/snapshots/")
 
             return self.final_data
 

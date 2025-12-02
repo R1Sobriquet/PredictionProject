@@ -34,7 +34,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('forecasting_pipeline.log'),
+        logging.FileHandler('logs/forecasting_pipeline.log'),
         logging.StreamHandler(sys.stdout)
     ]
 )
