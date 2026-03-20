@@ -263,7 +263,7 @@ class HistoricalMeanBaseline(BaselineModel):
         Prédit la moyenne historique pour toutes les dates.
         """
         if article_id not in self.article_stats:
-            mean_value = 0.0
+            mean_value = 0.0;
         else:
             mean_value = self.article_stats[article_id]
 

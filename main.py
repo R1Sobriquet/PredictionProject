@@ -27,6 +27,7 @@ from src import (
     create_article_dashboard, create_global_analysis, analyze_article_pattern
 )
 from src.models.baseline import create_baseline_suite, evaluate_all_baselines
+from src.models.catboost_model import CatBoostForecaster, train_and_evaluate_catboost
 from src.utils import ColumnNames, get_file_path, Messages
 
 # Configuration du logging principal
@@ -226,6 +227,73 @@ def run_baselines_step() -> bool:
         return False
 
 
+def run_catboost_step(max_horizon: int = 90) -> bool:
+    """
+    Exécute l'entraînement et l'évaluation du modèle CatBoost.
+
+    Args:
+        max_horizon: Horizon maximum de prédiction en jours
+
+    Returns:
+        bool: Succès de l'opération
+    """
+    logger.info("🚀 ENTRAÎNEMENT DU MODÈLE CATBOOST")
+    logger.info("=" * 60)
+
+    try:
+        # Chargement des données enrichies
+        enriched_file = get_file_path('enriched')
+        if not enriched_file.exists():
+            logger.error("❌ Fichier de données enrichies non trouvé. Exécutez d'abord les étapes précédentes.")
+            return False
+
+        enriched_data = pd.read_csv(
+            enriched_file,
+            parse_dates=[ColumnNames.DATE],
+            date_format='%Y-%m-%d'
+        )
+
+        logger.info(f"   📊 Données chargées : {len(enriched_data)} lignes")
+
+        # Entraînement et évaluation
+        model, results_by_horizon = train_and_evaluate_catboost(
+            enriched_data,
+            max_horizon=max_horizon,
+            test_ratio=0.2
+        )
+
+        # Sauvegarde des résultats par horizon
+        output_dir = Path("data/output")
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        results_by_horizon.to_csv(output_dir / "catboost_results_by_horizon.csv", index=False)
+        logger.info(f"💾 Résultats par horizon sauvegardés")
+
+        # Sauvegarde du modèle
+        model.save_model(output_dir / "catboost_model")
+        logger.info(f"💾 Modèle sauvegardé dans {output_dir / 'catboost_model'}")
+
+        # Affichage du résumé
+        logger.info("=" * 60)
+        logger.info("📊 PERFORMANCE PAR HORIZON :")
+        for _, row in results_by_horizon.iterrows():
+            logger.info(f"   H+{row['horizon']:2.0f}j : MAE={row['mae']:.2f}, RMSE={row['rmse']:.2f}")
+
+        # Feature importance
+        importance_df = model.get_feature_importance()
+        logger.info("\n📊 TOP 5 FEATURES :")
+        for _, row in importance_df.head(5).iterrows():
+            logger.info(f"   {row['feature']}: {row['importance']:.1f}")
+
+        return True
+
+    except Exception as e:
+        logger.error(f"❌ ERREUR LORS DE L'ENTRAÎNEMENT CATBOOST : {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
 def analyze_specific_article(article_id: int) -> bool:
     """
     Analyse détaillée d'un article spécifique.
@@ -310,7 +378,8 @@ def run_full_pipeline() -> bool:
         ("Ingestion", run_ingestion_step),
         ("Enrichissement", run_enrichment_step),
         ("Analyse", run_analysis_step),
-        ("Baselines", run_baselines_step)
+        ("Baselines", run_baselines_step),
+        ("CatBoost", run_catboost_step)
     ]
 
     success_count = 0
@@ -361,7 +430,7 @@ Exemples d'utilisation :
 
     parser.add_argument(
         '--step',
-        choices=['ingestion', 'enrichment', 'analysis', 'baselines', 'all'],
+        choices=['ingestion', 'enrichment', 'analysis', 'baselines', 'catboost', 'all'],
         help='Étape du pipeline à exécuter'
     )
 
@@ -396,6 +465,8 @@ Exemples d'utilisation :
             success = run_analysis_step()
         elif args.step == 'baselines':
             success = run_baselines_step()
+        elif args.step == 'catboost':
+            success = run_catboost_step()
         elif args.step == 'all':
             success = run_full_pipeline()
 
