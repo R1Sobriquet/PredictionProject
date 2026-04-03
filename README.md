@@ -76,9 +76,9 @@ DB_TABLE=d_CommandesDetailCalcul
 ```env
 DATA_SOURCE=database
 DB_TYPE=sqlserver
-DB_SERVER=10.147.18.196
+DB_SERVER=x.x.x.x
 DB_NAME=Python
-DB_USER=sa
+DB_USER=user
 DB_PASSWORD=motdepasse
 DB_TABLE=d_CommandesDetailCalcul
 DB_DRIVER=ODBC Driver 17 for SQL Server
