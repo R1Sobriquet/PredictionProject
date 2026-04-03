@@ -1,244 +1,193 @@
 """
-Tests minimaux pour data_ingestion.py
+Tests pour data_ingestion.py (pipeline ATM)
 
-3 tests essentiels qui couvrent 90% des cas d'usage :
-1. Cas normal (le pipeline fonctionne)
-2. Cas d'erreur (gestion des problèmes)
-3. Qualité finale (données propres et complètes)
+3 tests essentiels :
+1. Cas normal (pipeline fonctionne avec données ATM)
+2. Cas d'erreur (commandes annulées, montants invalides)
+3. Qualité finale (déduplication, colonnes standardisées)
 
 Usage:
-    pytest tests/test_data_ingestion_minimal.py -v
+    pytest tests/test_data_ingestion.py -v
 """
 
 import pytest
 import pandas as pd
+import numpy as np
 from pathlib import Path
 import sys
 
-# Ajouter le répertoire racine au path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from src.data_ingestion import DataIngestionPipeline
-from src.utils.config import ColumnNames
+from src.utils.config import ColumnNames, COLUMNS_TO_LOAD
+
+
+def _create_test_excel(tmp_path, data: pd.DataFrame, filename="test.xlsx") -> Path:
+    """Helper : crée un fichier Excel de test avec les colonnes DC_*."""
+    filepath = tmp_path / filename
+    data.to_excel(filepath, index=False, engine='openpyxl')
+    return filepath
+
+
+def _make_base_data(n_rows=10):
+    """Crée des données ATM de base avec les colonnes DC_* requises."""
+    data = {
+        'DC_Commande_Id': list(range(1, n_rows + 1)),
+        'DC_Automate_Id': [101, 102] * (n_rows // 2) + [101] * (n_rows % 2),
+        'DC_Date_Cmd': pd.date_range('2026-01-01', periods=n_rows, freq='D'),
+        'DC_Type_Cmd': ['standard'] * n_rows,
+        'DC_Montant_Cmd': np.random.randint(5000, 50000, n_rows).astype(float),
+        'DC_Livraison_Prev_Date': pd.date_range('2026-01-02', periods=n_rows, freq='D'),
+        'DC_Chargement_Prev_Date': pd.date_range('2026-01-03', periods=n_rows, freq='D'),
+        'DC_Cassette_1': np.random.randint(0, 100, n_rows),
+        'DC_Cassette_2': np.random.randint(0, 100, n_rows),
+        'DC_Cassette_3': np.random.randint(0, 100, n_rows),
+        'DC_Cassette_4': np.random.randint(0, 100, n_rows),
+        'DC_Cassette_5': np.random.randint(0, 100, n_rows),
+        'DC_Ajustement_5': np.random.randint(0, 500, n_rows),
+        'DC_Ajustement_10': np.random.randint(0, 500, n_rows),
+        'DC_Ajustement_20': np.random.randint(0, 500, n_rows),
+        'DC_Ajustement_50': np.random.randint(0, 500, n_rows),
+        'DC_Ajustement_100': np.random.randint(0, 500, n_rows),
+        'DC_SoldesDuJour_5': np.random.randint(0, 1000, n_rows),
+        'DC_SoldesDuJour_10': np.random.randint(0, 1000, n_rows),
+        'DC_SoldesDuJour_20': np.random.randint(0, 1000, n_rows),
+        'DC_SoldesDuJour_50': np.random.randint(0, 1000, n_rows),
+        'DC_SoldesDuJour_100': np.random.randint(0, 1000, n_rows),
+        'DC_K7HS_5': [0] * n_rows,
+        'DC_K7HS_10': [0] * n_rows,
+        'DC_K7HS_20': [0] * n_rows,
+        'DC_K7HS_50': [0] * n_rows,
+        'DC_K7HS_100': [0] * n_rows,
+        'DC_VolatiliteDmq': np.random.uniform(0, 1, n_rows).round(2),
+        'DC_DmqForteDecroissance': [0] * n_rows,
+        'DC_DmqForteCroissance': [0] * n_rows,
+        'DC_Annule': [0] * n_rows,
+        'DC_Chargé': [1] * n_rows,
+        'DC_EvenementEnCour': [0] * n_rows,
+        'DC_RisqueAutomateVide': [0] * n_rows,
+    }
+    return pd.DataFrame(data)
 
 
 def test_pipeline_works_basic(tmp_path):
     """
     Test 1 : CAS NORMAL
 
-    Vérifie que le pipeline fonctionne de bout en bout avec des données normales.
-
-    Scénario :
-    - Données propres avec 3 articles sur 5 jours
-    - Aucune erreur attendue
-    - Le pipeline doit se terminer avec succès
+    Vérifie que le pipeline fonctionne avec des données ATM valides.
     """
+    data = _make_base_data(10)
+    filepath = _create_test_excel(tmp_path, data)
 
-    # ===== DONNÉES D'ENTRÉE =====
-    data = pd.DataFrame({
-        'date_ligne_commande': [
-            '2024-01-01', '2024-01-01', '2024-01-01',  # Jour 1 : 3 articles
-            '2024-01-02', '2024-01-02',                 # Jour 2 : 2 articles
-            '2024-01-03', '2024-01-03', '2024-01-03',  # Jour 3 : 3 articles
-            '2024-01-04',                               # Jour 4 : 1 article
-            '2024-01-05', '2024-01-05'                  # Jour 5 : 2 articles
-        ],
-        'id_article': [1, 2, 3, 1, 2, 1, 2, 3, 1, 2, 3],
-        'quantite': [50, 30, 25, 45, 35, 60, 40, 30, 55, 45, 35],
-        'ref_article': ['REF001', 'REF002', 'REF003'] * 3 + ['REF001', 'REF002']
-    })
+    pipeline = DataIngestionPipeline(filepath)
+    result = pipeline.run_full_pipeline(save_snapshots=False)
 
-    csv_file = tmp_path / "test_normal.csv"
-    data.to_csv(csv_file, index=False)
+    # Vérifications de base
+    assert result is not None
+    assert len(result) > 0
 
-    # ===== EXÉCUTION DU PIPELINE =====
-    pipeline = DataIngestionPipeline(csv_file)
-    result = pipeline.run_full_pipeline()
+    # Colonnes standardisées présentes
+    assert ColumnNames.ORDER_ID in result.columns
+    assert ColumnNames.ATM_ID in result.columns
+    assert ColumnNames.ORDER_DATE in result.columns
+    assert ColumnNames.AMOUNT in result.columns
 
-    # ===== VÉRIFICATIONS DE BASE =====
-    assert result is not None, "Le pipeline doit retourner des données"
-    assert len(result) > 0, "Le résultat ne doit pas être vide"
+    # Pas de valeurs manquantes sur les colonnes critiques
+    assert result[ColumnNames.ORDER_ID].isna().sum() == 0
+    assert result[ColumnNames.ATM_ID].isna().sum() == 0
+    assert result[ColumnNames.AMOUNT].isna().sum() == 0
 
-    # Vérifier que les colonnes essentielles existent
-    assert ColumnNames.DATE in result.columns
-    assert ColumnNames.ARTICLE_ID in result.columns
-    assert ColumnNames.QUANTITY in result.columns
+    # Types corrects
+    assert pd.api.types.is_datetime64_any_dtype(result[ColumnNames.ORDER_DATE])
+    assert pd.api.types.is_float_dtype(result[ColumnNames.AMOUNT])
 
-    # Vérifier qu'il n'y a pas de valeurs manquantes
-    assert result[ColumnNames.DATE].isna().sum() == 0
-    assert result[ColumnNames.ARTICLE_ID].isna().sum() == 0
-    assert result[ColumnNames.QUANTITY].isna().sum() == 0
-
-    # Vérifier les types de données
-    assert pd.api.types.is_datetime64_any_dtype(result[ColumnNames.DATE])
-    assert pd.api.types.is_integer_dtype(result[ColumnNames.ARTICLE_ID])
-    assert pd.api.types.is_integer_dtype(result[ColumnNames.QUANTITY])
-
-    print(f"✅ Test réussi : {len(result)} lignes générées pour 3 articles")
+    print(f"Test réussi : {len(result)} commandes ATM ingérées")
 
 
 def test_pipeline_handles_errors(tmp_path):
     """
     Test 2 : CAS D'ERREUR
 
-    Vérifie que le pipeline gère correctement les problèmes courants :
-    - Doublons (même jour/article plusieurs fois)
-    - Valeurs aberrantes (quantités négatives ou trop élevées)
-    - Dates en dehors de la période (décembre 2024)
-
-    Le pipeline doit nettoyer automatiquement ces problèmes.
+    Vérifie que le pipeline gère :
+    - Commandes annulées (DC_Annule = 1) → exclues
+    - Montants négatifs ou aberrants → exclus
+    - Doublons sur DC_Commande_Id → dédupliqués
     """
+    data = _make_base_data(8)
 
-    # ===== DONNÉES AVEC PROBLÈMES =====
-    data = pd.DataFrame({
-        'date_ligne_commande': [
-            '2024-01-01', '2024-01-01',  # DOUBLON EXACT (même ligne 2 fois)
-            '2024-01-02', '2024-01-02',  # DOUBLON À AGRÉGER (quantités différentes)
-            '2024-01-03',                # Quantité négative
-            '2024-01-04',                # Quantité aberrante (trop haute)
-            '2024-12-01',                # HORS PÉRIODE (décembre = exclu)
-            '2024-01-05'                 # Ligne normale
-        ],
-        'id_article': [1, 1, 1, 1, 1, 1, 1, 2],
-        'quantite': [50, 50, 30, 20, -10, 25000, 100, 40],
-        'ref_article': ['REF001'] * 7 + ['REF002']
-    })
+    # Commande annulée
+    data.loc[0, 'DC_Annule'] = 1
 
-    csv_file = tmp_path / "test_errors.csv"
-    data.to_csv(csv_file, index=False)
+    # Montant négatif
+    data.loc[1, 'DC_Montant_Cmd'] = -500.0
 
-    # ===== EXÉCUTION DU PIPELINE =====
-    pipeline = DataIngestionPipeline(csv_file)
-    result = pipeline.run_full_pipeline()
+    # Montant aberrant (> 500 000)
+    data.loc[2, 'DC_Montant_Cmd'] = 999999.0
 
-    # ===== VÉRIFICATIONS DES CORRECTIONS =====
+    # Doublon sur DC_Commande_Id
+    data.loc[7, 'DC_Commande_Id'] = data.loc[3, 'DC_Commande_Id']
 
-    # 1. Pas de quantités négatives
-    assert all(result[ColumnNames.QUANTITY] >= 0), \
-        "Les quantités négatives doivent être supprimées"
+    filepath = _create_test_excel(tmp_path, data)
 
-    # 2. Pas de quantités aberrantes (> 10000)
-    assert all(result[ColumnNames.QUANTITY] <= 10000), \
-        "Les quantités aberrantes doivent être supprimées"
+    pipeline = DataIngestionPipeline(filepath)
+    result = pipeline.run_full_pipeline(save_snapshots=False)
 
-    # 3. Pas de doublons (même date + même article)
-    duplicates = result.duplicated(subset=[ColumnNames.DATE, ColumnNames.ARTICLE_ID])
-    assert duplicates.sum() == 0, \
-        "Les doublons doivent être supprimés ou agrégés"
+    # Pas de commandes annulées
+    if ColumnNames.ANNULE in result.columns:
+        assert (result[ColumnNames.ANNULE] == 1).sum() == 0
 
-    # 4. Dates filtrées (pas de décembre)
-    dates = pd.to_datetime(result[ColumnNames.DATE])
-    assert all(dates.dt.month != 12), \
-        "Décembre 2024 doit être exclu de la période d'entraînement"
+    # Pas de montants négatifs
+    assert all(result[ColumnNames.AMOUNT] >= 0)
 
-    # 5. Agrégation vérifiée (2024-01-02 article 1 : 30+20=50)
-    jan2_article1 = result[
-        (result[ColumnNames.DATE] == pd.Timestamp('2024-01-02')) &
-        (result[ColumnNames.ARTICLE_ID] == 1)
-    ]
-    if len(jan2_article1) > 0:
-        # Si la ligne existe, elle doit être agrégée (30 + 20 = 50)
-        # Ou une des deux valeurs si l'autre est considérée aberrante
-        assert jan2_article1.iloc[0][ColumnNames.QUANTITY] in [30, 50], \
-            "Les quantités du même jour doivent être agrégées"
+    # Pas de montants aberrants
+    assert all(result[ColumnNames.AMOUNT] <= 500000)
 
-    print(f"✅ Test réussi : Toutes les erreurs ont été gérées correctement")
+    # Pas de doublons sur order_id
+    assert result.duplicated(subset=[ColumnNames.ORDER_ID]).sum() == 0
+
+    # Au moins 4 lignes valides restantes (8 - 1 annulée - 1 négatif - 1 aberrant - 1 doublon)
+    assert len(result) >= 4
+
+    print(f"Test réussi : erreurs gérées, {len(result)} commandes valides")
 
 
 def test_pipeline_output_quality(tmp_path):
     """
     Test 3 : QUALITÉ FINALE
 
-    Vérifie que le résultat final a la structure attendue :
-    - 1 ligne par jour ET par article (même si quantité = 0)
-    - Les jours sans commande sont ajoutés avec quantité = 0
-    - Pas de trous dans la chronologie
-
-    C'est le test le plus important car il valide l'objectif principal du module.
+    Vérifie la structure du résultat :
+    - Colonnes standardisées (noms internes, pas DC_*)
+    - Commandes individuelles préservées (pas d'agrégation)
+    - Tri par date + ATM
     """
+    data = _make_base_data(10)
+    filepath = _create_test_excel(tmp_path, data)
 
-    # ===== DONNÉES D'ENTRÉE AVEC TROUS =====
-    # On donne seulement 3 jours de données, 2 articles
-    # Le pipeline doit remplir tous les jours manquants
-    data = pd.DataFrame({
-        'date_ligne_commande': [
-            '2024-01-01', '2024-01-01',  # Jour 1 : Article 1 et 2
-            '2024-01-03',                 # Jour 3 : Article 1 seulement
-            # Jour 2 : MANQUANT complètement
-            # Jour 3 : Article 2 MANQUANT
-        ],
-        'id_article': [1, 2, 1],
-        'quantite': [50, 30, 60],
-        'ref_article': ['REF001', 'REF002', 'REF001']
-    })
+    pipeline = DataIngestionPipeline(filepath)
+    result = pipeline.run_full_pipeline(save_snapshots=False)
 
-    csv_file = tmp_path / "test_quality.csv"
-    data.to_csv(csv_file, index=False)
+    # Les colonnes source DC_* ne doivent plus être là (standardisées)
+    dc_columns = [c for c in result.columns if c.startswith('DC_')]
+    assert len(dc_columns) == 0, f"Colonnes DC_* non standardisées : {dc_columns}"
 
-    # ===== EXÉCUTION DU PIPELINE =====
-    pipeline = DataIngestionPipeline(csv_file)
-    result = pipeline.run_full_pipeline()
+    # Commandes individuelles préservées
+    assert len(result) == 10, f"Toutes les commandes doivent être préservées, obtenu {len(result)}"
 
-    # ===== VÉRIFICATIONS DE QUALITÉ =====
+    # Tri par date
+    dates = result[ColumnNames.ORDER_DATE].values
+    assert all(dates[i] <= dates[i + 1] for i in range(len(dates) - 1)), \
+        "Les données doivent être triées par date"
 
-    # 1. Structure : 1 ligne par jour ET par articles
-    unique_dates = result[ColumnNames.DATE].nunique()
-    unique_articles = result[ColumnNames.ARTICLE_ID].nunique()
-    expected_lines = unique_dates * unique_articles
-
-    assert len(result) == expected_lines, \
-        f"Doit avoir {expected_lines} lignes (1 par jour/article), obtenu {len(result)}"
-
-    # 2. Pas de doublons jour/article
-    duplicates = result.duplicated(subset=[ColumnNames.DATE, ColumnNames.ARTICLE_ID])
-    assert duplicates.sum() == 0, \
-        "Chaque combinaison jour/article doit être unique"
-
-    # 3. Des zéros ont été ajoutés pour les jours manquants
-    zero_count = (result[ColumnNames.QUANTITY] == 0).sum()
-    assert zero_count > 0, \
-        "Des lignes avec quantité=0 doivent être ajoutées pour les jours sans commande"
-
-    # 4. Vérification d'un cas spécifique : 2024-01-02 article 1 doit exister avec qty=0
-    jan2_article1 = result[
-        (result[ColumnNames.DATE] == pd.Timestamp('2024-01-02')) &
-        (result[ColumnNames.ARTICLE_ID] == 1)
-    ]
-    assert len(jan2_article1) == 1, \
-        "Le 2024-01-02 article 1 doit exister (même sans commande dans les données)"
-    assert jan2_article1.iloc[0][ColumnNames.QUANTITY] == 0, \
-        "Le 2024-01-02 article 1 doit avoir quantité=0 (jour manquant)"
-
-    # 5. Vérification cas spécifique : 2024-01-03 article 2 doit exister avec qty=0
-    jan3_article2 = result[
-        (result[ColumnNames.DATE] == pd.Timestamp('2024-01-03')) &
-        (result[ColumnNames.ARTICLE_ID] == 2)
-    ]
-    assert len(jan3_article2) == 1, \
-        "Le 2024-01-03 article 2 doit exister (même sans commande)"
-    assert jan3_article2.iloc[0][ColumnNames.QUANTITY] == 0, \
-        "Le 2024-01-03 article 2 doit avoir quantité=0 (article manquant ce jour)"
-
-    # 6. Les quantités existantes sont préservées
-    jan1_article1 = result[
-        (result[ColumnNames.DATE] == pd.Timestamp('2024-01-01')) &
-        (result[ColumnNames.ARTICLE_ID] == 1)
-    ]
-    assert jan1_article1.iloc[0][ColumnNames.QUANTITY] == 50, \
-        "Les quantités existantes doivent être préservées"
-
-    # 7. Résumé statistique
+    # Résumé
     summary = pipeline.get_data_summary()
-    assert summary['zero_quantity_lines'] > 0
-    assert summary['total_quantity'] > 0
+    assert summary['total_orders'] == 10
+    assert summary['unique_atms'] >= 1
+    assert summary['total_amount'] > 0
 
-    print(f"✅ Test réussi : Structure finale parfaite")
-    print(f"   📊 {len(result)} lignes ({unique_dates} jours × {unique_articles} articles)")
-    print(f"   📉 {zero_count} lignes avec quantité=0 (jours manquants)")
-    print(f"   📈 {len(result) - zero_count} lignes avec commandes")
+    print(f"Test réussi : structure finale correcte ({len(result)} commandes, "
+          f"{summary['unique_atms']} ATMs)")
 
 
-# ===== POINT D'ENTRÉE POUR EXÉCUTION DIRECTE =====
 if __name__ == "__main__":
     pytest.main([__file__, '-v', '-s'])

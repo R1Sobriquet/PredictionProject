@@ -1,13 +1,13 @@
 """
-Tests minimaux pour data_processing.py
+Tests pour data_processing.py (enrichissement ATM)
 
-3 tests essentiels qui couvrent 90% des cas d'usage :
-1. Cas normal (l'enrichissement fonctionne)
-2. Variables ajoutées (toutes les colonnes temporelles sont là)
-3. Qualité des calculs (quantity_prev_day correct)
+3 tests essentiels :
+1. Enrichissement fonctionne de bout en bout
+2. Variables temporelles et historiques ATM ajoutées
+3. Qualité des calculs (days_since_last_order, last_order_amount)
 
 Usage:
-    pytest tests/test_data_processing_minimal.py -v
+    pytest tests/test_data_processing.py -v
 """
 
 import pytest
@@ -17,235 +17,196 @@ from datetime import datetime
 from pathlib import Path
 import sys
 
-# Ajouter le répertoire racine au path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from src.data_processing import DataEnrichmentPipeline
-from src.utils.config import ColumnNames, WEEKDAY_NAMES
+from src.utils.config import ColumnNames
 
 
-def test_enrichment_works_basic(tmp_path):
+def _make_clean_data():
+    """Crée des données nettoyées (sortie de data_ingestion) pour les tests."""
+    return pd.DataFrame({
+        ColumnNames.ORDER_ID: [1, 2, 3, 4, 5, 6],
+        ColumnNames.ATM_ID: [101, 101, 101, 102, 102, 102],
+        ColumnNames.ORDER_DATE: [
+            datetime(2026, 1, 5),   # Lundi
+            datetime(2026, 1, 8),   # Jeudi (3 jours après)
+            datetime(2026, 1, 12),  # Lundi (4 jours après)
+            datetime(2026, 1, 6),   # Mardi
+            datetime(2026, 1, 10),  # Samedi (4 jours après)
+            datetime(2026, 1, 15),  # Jeudi (5 jours après)
+        ],
+        ColumnNames.AMOUNT: [10000.0, 15000.0, 12000.0, 8000.0, 9000.0, 11000.0],
+        ColumnNames.ORDER_TYPE: ['standard'] * 6,
+        ColumnNames.DELIVERY_DATE: pd.to_datetime([
+            '2026-01-06', '2026-01-09', '2026-01-13',
+            '2026-01-07', '2026-01-12', '2026-01-16',
+        ]),
+        ColumnNames.LOADING_DATE: pd.to_datetime([
+            '2026-01-07', '2026-01-10', '2026-01-14',
+            '2026-01-08', '2026-01-13', '2026-01-17',
+        ]),
+        ColumnNames.CASSETTE_1: [50, 60, 55, 40, 45, 50],
+        ColumnNames.CASSETTE_2: [30, 35, 32, 25, 28, 30],
+        ColumnNames.CASSETTE_3: [0, 0, 0, 20, 22, 25],
+        ColumnNames.CASSETTE_4: [0, 0, 0, 0, 0, 0],
+        ColumnNames.CASSETTE_5: [0, 0, 0, 0, 0, 0],
+        ColumnNames.SOLDES_5: [100, 200, 150, 80, 90, 110],
+        ColumnNames.SOLDES_10: [200, 300, 250, 160, 180, 220],
+        ColumnNames.SOLDES_20: [500, 600, 550, 400, 450, 500],
+        ColumnNames.SOLDES_50: [1000, 1200, 1100, 800, 900, 1000],
+        ColumnNames.SOLDES_100: [2000, 2500, 2200, 1600, 1800, 2000],
+        ColumnNames.K7HS_5: [0, 0, 0, 0, 0, 0],
+        ColumnNames.K7HS_10: [0, 0, 0, 0, 0, 0],
+        ColumnNames.K7HS_20: [0, 0, 0, 0, 0, 0],
+        ColumnNames.K7HS_50: [0, 0, 0, 0, 0, 0],
+        ColumnNames.K7HS_100: [0, 0, 0, 0, 0, 0],
+        ColumnNames.VOLATILITE_DMQ: [0.5, 0.6, 0.55, 0.4, 0.45, 0.5],
+        ColumnNames.DMQ_FORTE_DECROISSANCE: [0, 0, 0, 0, 0, 0],
+        ColumnNames.DMQ_FORTE_CROISSANCE: [0, 0, 0, 0, 0, 0],
+        ColumnNames.EVENEMENT_EN_COURS: [0, 0, 0, 0, 0, 0],
+        ColumnNames.RISQUE_ATM_VIDE: [0, 0, 0, 0, 0, 0],
+        ColumnNames.CHARGE: [1, 1, 1, 1, 1, 1],
+        ColumnNames.ANNULE: [0, 0, 0, 0, 0, 0],
+    })
+
+
+def test_enrichment_works_basic():
     """
     Test 1 : CAS NORMAL
 
     Vérifie que le pipeline d'enrichissement fonctionne de bout en bout.
-
-    Scénario :
-    - Données nettoyées (1 ligne par jour/article)
-    - Enrichissement avec variables temporelles
-    - Le pipeline doit se terminer avec succès
     """
+    clean_data = _make_clean_data()
 
-    # ===== DONNÉES D'ENTRÉE NETTOYÉES =====
-    # Format : sortie de data_ingestion.py
-    dates = pd.date_range('2024-01-01', '2024-01-10', freq='D')
-
-    data = []
-    for date in dates:
-        for article_id in [1, 2]:
-            data.append({
-                ColumnNames.DATE: date,
-                ColumnNames.ARTICLE_ID: article_id,
-                ColumnNames.QUANTITY: np.random.randint(20, 60)
-            })
-
-    clean_data = pd.DataFrame(data)
-
-    # Sauvegarder dans un fichier temporaire
-    csv_file = tmp_path / "clean_data.csv"
-    clean_data.to_csv(csv_file, index=False)
-
-    # ===== EXÉCUTION DU PIPELINE =====
     pipeline = DataEnrichmentPipeline()
-    pipeline.clean_data = clean_data  # Injection directe des données
-    result = pipeline.run_full_enrichment(save_output=False)
+    pipeline.clean_data = clean_data
+    result = pipeline.run_full_enrichment(save_output=False, save_snapshots=False)
 
-    # ===== VÉRIFICATIONS DE BASE =====
-    assert result is not None, "Le pipeline doit retourner des données"
-    assert len(result) == len(clean_data), "Le nombre de lignes doit être conservé"
+    assert result is not None
+    assert len(result) == len(clean_data), "Nombre de lignes doit être conservé"
 
-    # Vérifier que les colonnes de base sont toujours là
-    assert ColumnNames.DATE in result.columns
-    assert ColumnNames.ARTICLE_ID in result.columns
-    assert ColumnNames.QUANTITY in result.columns
+    # Colonnes de base toujours présentes
+    assert ColumnNames.ORDER_DATE in result.columns
+    assert ColumnNames.ATM_ID in result.columns
+    assert ColumnNames.AMOUNT in result.columns
 
-    # Vérifier qu'il y a plus de colonnes qu'avant (enrichissement)
-    original_columns = len(clean_data.columns)
-    enriched_columns = len(result.columns)
-    assert enriched_columns > original_columns, \
-        f"Doit avoir plus de colonnes après enrichissement ({original_columns} → {enriched_columns})"
+    # Plus de colonnes qu'avant
+    assert len(result.columns) > len(clean_data.columns)
 
-    # Vérifier qu'il n'y a pas de valeurs manquantes dans les colonnes temporelles
-    assert result[ColumnNames.WEEKDAY].isna().sum() == 0
-    assert result[ColumnNames.WEEKDAY_NAME].isna().sum() == 0
-
-    print(f"✅ Test réussi : {original_columns} colonnes → {enriched_columns} colonnes enrichies")
+    print(f"Test réussi : {len(clean_data.columns)} -> {len(result.columns)} colonnes")
 
 
-def test_enrichment_adds_variables(tmp_path):
+def test_enrichment_adds_variables():
     """
     Test 2 : VARIABLES AJOUTÉES
 
-    Vérifie que toutes les variables temporelles et de retard sont ajoutées :
-    - Variables temporelles : weekday, weekday_name, is_weekend, month, etc.
-    - Variables de retard : quantity_prev_day (quantité du jour précédent)
-    - Moyennes mobiles : quantity_rolling_mean_7d, quantity_rolling_mean_30d
-
-    C'est le test le plus important car il valide l'objectif du module.
+    Vérifie que toutes les features attendues sont présentes :
+    - Temporelles (weekday, is_weekend, etc.)
+    - Historiques ATM (days_since_last_order, last_order_amount, etc.)
+    - Agrégées (total_soldes, cassettes_actives, etc.)
+    - Saisonnières (day_of_year, sin/cos)
     """
+    clean_data = _make_clean_data()
 
-    # ===== DONNÉES D'ENTRÉE AVEC PATTERNS CONNUS =====
-    data = pd.DataFrame({
-        ColumnNames.DATE: [
-            datetime(2024, 1, 1),   # Lundi
-            datetime(2024, 1, 2),   # Mardi
-            datetime(2024, 1, 3),   # Mercredi
-            datetime(2024, 1, 4),   # Jeudi
-            datetime(2024, 1, 5),   # Vendredi
-            datetime(2024, 1, 6),   # Samedi (weekend)
-            datetime(2024, 1, 7),   # Dimanche (weekend)
-        ],
-        ColumnNames.ARTICLE_ID: [1, 1, 1, 1, 1, 1, 1],
-        ColumnNames.QUANTITY: [50, 45, 60, 55, 50, 30, 20]
-    })
-
-    # ===== EXÉCUTION DU PIPELINE =====
     pipeline = DataEnrichmentPipeline()
-    pipeline.clean_data = data
-    result = pipeline.run_full_enrichment(save_output=False)
+    pipeline.clean_data = clean_data
+    result = pipeline.run_full_enrichment(save_output=False, save_snapshots=False)
 
-    # ===== VÉRIFICATION DES VARIABLES TEMPORELLES =====
-
-    # 1. Variables temporelles de base
-    required_temporal_columns = [
-        ColumnNames.YEAR,           # year
-        ColumnNames.MONTH,          # month
-        ColumnNames.DAY,            # day
-        ColumnNames.WEEKDAY,        # weekday (0-6)
-        ColumnNames.WEEKDAY_NAME,   # weekday_name (Lundi, Mardi...)
-        ColumnNames.IS_WEEKEND,     # is_weekend (True/False)
-        ColumnNames.WEEK_NUMBER     # week_number
+    # Variables temporelles
+    temporal_cols = [
+        ColumnNames.YEAR, ColumnNames.MONTH, ColumnNames.DAY,
+        ColumnNames.WEEKDAY, ColumnNames.WEEKDAY_NAME,
+        ColumnNames.IS_WEEKEND, ColumnNames.WEEK_NUMBER,
     ]
+    for col in temporal_cols:
+        assert col in result.columns, f"Colonne temporelle {col} manquante"
 
-    for col in required_temporal_columns:
-        assert col in result.columns, f"Colonne {col} doit être ajoutée"
+    # Variables historiques ATM
+    history_cols = [
+        ColumnNames.DAYS_SINCE_LAST_ORDER,
+        ColumnNames.LAST_ORDER_AMOUNT,
+        ColumnNames.AVG_RELOAD_FREQUENCY,
+        ColumnNames.AVG_ORDER_AMOUNT,
+        ColumnNames.STD_ORDER_AMOUNT,
+        ColumnNames.ORDER_COUNT_LAST_30D,
+    ]
+    for col in history_cols:
+        assert col in result.columns, f"Colonne historique {col} manquante"
 
-    print("✅ Toutes les variables temporelles sont présentes")
+    # Variables agrégées ATM
+    assert 'total_soldes' in result.columns
+    assert 'cassettes_actives' in result.columns
+    assert 'delivery_delay' in result.columns
+    assert 'loading_delay' in result.columns
 
-    # 2. Vérification des valeurs : jour de la semaine
-    # 2024-01-01 = Lundi (weekday=0)
-    assert result.iloc[0][ColumnNames.WEEKDAY] == 0, \
-        "2024-01-01 doit être un lundi (weekday=0)"
-    assert result.iloc[0][ColumnNames.WEEKDAY_NAME] == "Lundi", \
-        "2024-01-01 doit afficher 'Lundi'"
+    # Variables saisonnières
+    assert 'day_of_year' in result.columns
+    assert 'quarter' in result.columns
+    assert 'day_of_year_sin' in result.columns
 
-    # 3. Vérification des valeurs : weekend
-    # 2024-01-06 = Samedi (weekend)
-    assert result.iloc[5][ColumnNames.IS_WEEKEND] == True, \
-        "2024-01-06 (samedi) doit être marqué comme weekend"
-    assert result.iloc[6][ColumnNames.IS_WEEKEND] == True, \
-        "2024-01-07 (dimanche) doit être marqué comme weekend"
-
-    # 2024-01-01 = Lundi (pas weekend)
-    assert result.iloc[0][ColumnNames.IS_WEEKEND] == False, \
-        "2024-01-01 (lundi) ne doit pas être marqué comme weekend"
-
-    print("✅ Valeurs des jours de semaine et weekend correctes")
-
-    # ===== VÉRIFICATION DES VARIABLES DE RETARD =====
-
-    # 4. Variable de retard : quantity_prev_day
-    assert ColumnNames.QUANTITY_PREV_DAY in result.columns, \
-        "Colonne quantity_prev_day doit être ajoutée"
-
-    # Vérification manuelle des valeurs
-    # Jour 1 : quantity_prev_day = 0 (pas de jour précédent)
-    assert result.iloc[0][ColumnNames.QUANTITY_PREV_DAY] == 0, \
-        "Premier jour : quantity_prev_day doit être 0"
-
-    # Jour 2 : quantity_prev_day = 50 (quantité du jour 1)
-    assert result.iloc[1][ColumnNames.QUANTITY_PREV_DAY] == 50, \
-        f"Jour 2 : quantity_prev_day doit être 50 (qty jour 1), obtenu {result.iloc[1][ColumnNames.QUANTITY_PREV_DAY]}"
-
-    # Jour 3 : quantity_prev_day = 45 (quantité du jour 2)
-    assert result.iloc[2][ColumnNames.QUANTITY_PREV_DAY] == 45, \
-        f"Jour 3 : quantity_prev_day doit être 45 (qty jour 2), obtenu {result.iloc[2][ColumnNames.QUANTITY_PREV_DAY]}"
-
-    print("✅ Variable quantity_prev_day calculée correctement")
-
-    # ===== VÉRIFICATION DES MOYENNES MOBILES =====
-
-    # 5. Moyennes mobiles
-    rolling_7d = f"{ColumnNames.QUANTITY}_rolling_mean_7d"
-    rolling_30d = f"{ColumnNames.QUANTITY}_rolling_mean_30d"
-
-    assert rolling_7d in result.columns, \
-        "Colonne rolling_mean_7d doit être ajoutée"
-    assert rolling_30d in result.columns, \
-        "Colonne rolling_mean_30d doit être ajoutée"
-
-    # Vérification que ce sont des nombres valides
-    assert not result[rolling_7d].isna().all(), \
-        "rolling_mean_7d ne doit pas être que des NaN"
-
-    print("✅ Moyennes mobiles calculées")
-
-    # ===== VÉRIFICATION DES VARIABLES SAISONNIÈRES =====
-
-    # 6. Variables saisonnières (optionnelles mais utiles)
-    seasonal_columns = ['day_of_year', 'quarter', 'day_of_year_sin', 'day_of_year_cos']
-
-    for col in seasonal_columns:
-        if col in result.columns:
-            print(f"   ✅ Variable saisonnière {col} présente")
-
-    print(f"✅ Test réussi : {len(result.columns)} colonnes au total")
+    print("Test réussi : toutes les features sont présentes")
 
 
-def test_enrichment_output_quality(tmp_path):
+def test_enrichment_output_quality():
     """
     Test 3 : QUALITÉ DES CALCULS
 
-    Vérifie la précision des calculs, notamment quantity_prev_day :
-    - Pour chaque article, la quantité du jour précédent est correcte
-    - Les calculs sont faits PAR ARTICLE (pas mélangés entre articles)
-    - Les cas limites sont gérés (premier jour, changement d'article)
+    Vérifie la précision des calculs historiques ATM :
+    - days_since_last_order est correct
+    - last_order_amount est correct
+    - Les calculs sont faits PAR ATM
     """
+    clean_data = _make_clean_data()
 
-    # ===== DONNÉES AVEC 2 ARTICLES POUR TESTER LA SÉPARATION =====
-    data = pd.DataFrame({
-        ColumnNames.DATE: [
-            datetime(2024, 1, 1), datetime(2024, 1, 2), datetime(2024, 1, 3),  # Article 1
-            datetime(2024, 1, 1), datetime(2024, 1, 2), datetime(2024, 1, 3),  # Article 2
-        ],
-        ColumnNames.ARTICLE_ID: [1, 1, 1, 2, 2, 2],
-        ColumnNames.QUANTITY: [100, 200, 300, 50, 60, 70]
-    })
-
-    # ===== EXÉCUTION DU PIPELINE =====
     pipeline = DataEnrichmentPipeline()
-    pipeline.clean_data = data
-    result = pipeline.run_full_enrichment(save_output=False)
+    pipeline.clean_data = clean_data
+    result = pipeline.run_full_enrichment(save_output=False, save_snapshots=False)
 
-    # Trier pour avoir les données dans l'ordre
-    result = result.sort_values([ColumnNames.ARTICLE_ID, ColumnNames.DATE]).reset_index(drop=True)
+    # Trier comme le pipeline le fait
+    result = result.sort_values([ColumnNames.ATM_ID, ColumnNames.ORDER_DATE]).reset_index(drop=True)
 
-    # ===== VÉRIFICATIONS PAR ARTICLE =====
+    # ATM 101 : commandes le 5, 8, 12 janvier
+    atm101 = result[result[ColumnNames.ATM_ID] == 101].reset_index(drop=True)
 
-    # 1. ARTICLE 1 - Vérifications détaillées
-    article1_data = result[result[ColumnNames.ARTICLE_ID] == 1].reset_index(drop=True)
+    # Première commande : days_since_last = 0 (pas de précédent)
+    assert atm101.iloc[0][ColumnNames.DAYS_SINCE_LAST_ORDER] == 0, \
+        "Première commande : days_since_last_order doit être 0"
 
-    # Jour 1 Article 1 : quantity_prev_day = 0 (premier jour)
-    assert article1_data.iloc[0][ColumnNames.QUANTITY_PREV_DAY] == 0, \
-        "Article 1, Jour 1 : quantity_prev_day doit être 0 (pas de jour précédent)"
+    # Deuxième commande (8 jan) : 3 jours après le 5 jan
+    assert atm101.iloc[1][ColumnNames.DAYS_SINCE_LAST_ORDER] == 3, \
+        f"ATM 101, cmd 2 : days_since_last = 3, obtenu {atm101.iloc[1][ColumnNames.DAYS_SINCE_LAST_ORDER]}"
 
-    # Jour 2 Article 1 : quantity_prev_day = 100 (qty jour 1 article 1)
-    assert article1_data.iloc[1][ColumnNames.QUANTITY_PREV_DAY] == 100, \
-        f"Article 1, Jour 2 : quantity_prev_day doit être 100, obtenu {article1_data.iloc[1][ColumnNames.QUANTITY_PREV_DAY]}"
+    # Troisième commande (12 jan) : 4 jours après le 8 jan
+    assert atm101.iloc[2][ColumnNames.DAYS_SINCE_LAST_ORDER] == 4, \
+        f"ATM 101, cmd 3 : days_since_last = 4, obtenu {atm101.iloc[2][ColumnNames.DAYS_SINCE_LAST_ORDER]}"
 
-    # Jour 3 Article 1 : quantity_prev_day = 200 (qty jour 2 article 1)
-    assert article1_data.iloc[2][ColumnNames.QUANTITY_PREV_DAY] == 200, \
-        f"Article 1, Jour 3 : quantity_prev_day doit être 200, obtenu {article1_data.iloc[2][ColumnNames.QUANTITY_PREV_DAY]}"
+    # last_order_amount : première commande = 0, deuxième = montant de la première
+    assert atm101.iloc[0][ColumnNames.LAST_ORDER_AMOUNT] == 0, \
+        "Première commande : last_order_amount doit être 0"
 
-    print("✅ Article 1 : quantity_prev_day correct sur 3 jours")
+    assert atm101.iloc[1][ColumnNames.LAST_ORDER_AMOUNT] == 10000.0, \
+        f"ATM 101, cmd 2 : last_order_amount = 10000, obtenu {atm101.iloc[1][ColumnNames.LAST_ORDER_AMOUNT]}"
+
+    assert atm101.iloc[2][ColumnNames.LAST_ORDER_AMOUNT] == 15000.0, \
+        f"ATM 101, cmd 3 : last_order_amount = 15000, obtenu {atm101.iloc[2][ColumnNames.LAST_ORDER_AMOUNT]}"
+
+    # Vérification PAR ATM (ATM 102 séparé)
+    atm102 = result[result[ColumnNames.ATM_ID] == 102].reset_index(drop=True)
+    assert atm102.iloc[0][ColumnNames.DAYS_SINCE_LAST_ORDER] == 0, \
+        "ATM 102 : première commande indépendante de ATM 101"
+
+    # Delivery delay : delivery_date - order_date
+    assert atm101.iloc[0]['delivery_delay'] == 1, \
+        "ATM 101, cmd 1 : delivery_delay = 1 jour"
+
+    # Cassettes actives : ATM 101 a cassettes 1 et 2 actives (3,4,5 = 0)
+    assert atm101.iloc[0]['cassettes_actives'] == 2, \
+        f"ATM 101 : 2 cassettes actives, obtenu {atm101.iloc[0]['cassettes_actives']}"
+
+    print("Test réussi : calculs historiques ATM corrects")
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, '-v', '-s'])

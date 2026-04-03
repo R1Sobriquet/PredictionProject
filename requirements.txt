@@ -1,19 +1,25 @@
-# Forecasting Project Dependencies
-# Python 3.13.5 compatible
+# ATM Order Forecasting Project Dependencies
+# Python 3.13 compatible
 
 # Data manipulation and analysis
 pandas>=2.1.0
 numpy>=1.24.0
 
-# ===== NOUVEAU : SQL Server Support =====
-# Driver ODBC pour SQL Server
+# ===== Excel Support =====
+openpyxl>=3.1.0  # Lecture des fichiers .xlsx exportés depuis HFSQL
+
+# ===== Database Support =====
+# MySQL
+pymysql>=1.1.0
+
+# SQL Server
 pyodbc>=5.0.0
 
-# Gestion des variables d'environnement (.env)
-python-dotenv>=1.0.0
-
-# Database abstraction (optionnel, pour futures extensions)
+# Database abstraction
 sqlalchemy>=2.0.0
+
+# Environment variables
+python-dotenv>=1.0.0
 
 # ===== Visualization =====
 matplotlib>=3.7.0
@@ -37,27 +43,8 @@ pydantic>=2.0.0
 
 # ===== Utilities =====
 python-dateutil>=2.8.0
-tqdm>=4.65.0  # Progress bars
+tqdm>=4.65.0
 
 # ===== Development tools =====
-black>=23.0.0  # Code formatting
-flake8>=6.0.0  # Linting
-
-# ===== Documentation =====
-sphinx>=7.0.0  # Génération de la doc automatique
-
-# Pour SQL Server :
-# Windows :
-#   1. Installer le driver ODBC : https://learn.microsoft.com/en-us/sql/connect/odbc/download-odbc-driver-for-sql-server
-#   2. pip install pyodbc
-
-# Linux :
-#   1. sudo apt-get install unixodbc-dev
-#   2. pip install pyodbc
-
-# macOS :
-#   1. brew install unixodbc
-#   2. pip install pyodbc
-
-# Vérifier les drivers disponibles :
-#   python -c "import pyodbc; print(pyodbc.drivers())"
+black>=23.0.0
+flake8>=6.0.0
