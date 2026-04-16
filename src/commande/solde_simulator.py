@@ -14,12 +14,17 @@ import pandas as pd
 
 from .constants import CommandConfig, COUPURES
 
+try:
+    from ..utils.holidays import is_french_holiday as _is_french_holiday
+except ImportError:  # pragma: no cover - chemin fallback
+    from src.utils.holidays import is_french_holiday as _is_french_holiday
+
 
 # Type alias : callback injectable pour la gestion des jours fériés.
 IsHolidayFn = Callable[[date], bool]
 
-# Stub par défaut : aucun jour férié.
-DEFAULT_IS_HOLIDAY: IsHolidayFn = lambda _d: False  # noqa: E731
+# Par défaut : jours fériés français métropolitains (module sans dépendance).
+DEFAULT_IS_HOLIDAY: IsHolidayFn = _is_french_holiday
 
 
 @dataclass

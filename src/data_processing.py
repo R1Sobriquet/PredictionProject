@@ -25,6 +25,12 @@ try:
         AJUSTEMENT_COLUMNS,
         SOLDES_COLUMNS,
         K7HS_COLUMNS,
+        COUPURES,
+        SOLDES_BY_COUPURE,
+        DMQ_BY_COUPURE,
+        is_french_holiday,
+        is_eve_of_holiday,
+        is_payday,
         get_file_path,
     )
 except ImportError:
@@ -38,6 +44,12 @@ except ImportError:
         AJUSTEMENT_COLUMNS,
         SOLDES_COLUMNS,
         K7HS_COLUMNS,
+        COUPURES,
+        SOLDES_BY_COUPURE,
+        DMQ_BY_COUPURE,
+        is_french_holiday,
+        is_eve_of_holiday,
+        is_payday,
         get_file_path,
     )
 
@@ -110,6 +122,13 @@ class DataEnrichmentPipeline:
         self.enriched_data[ColumnNames.WEEKDAY_NAME] = self.enriched_data[ColumnNames.WEEKDAY].map(WEEKDAY_NAMES)
         self.enriched_data[ColumnNames.IS_WEEKEND] = self.enriched_data[ColumnNames.WEEKDAY].isin(WEEKEND_DAYS)
         self.enriched_data[ColumnNames.WEEK_NUMBER] = dt.dt.isocalendar().week
+
+        # Features calendrier FR (jours fériés + paie) — signaux forts pour la
+        # prévision (veille de férié = souvent pic, fins de mois = pics paie).
+        dates_py = dt.dt.date
+        self.enriched_data['is_holiday'] = dates_py.map(is_french_holiday).astype(bool)
+        self.enriched_data['is_eve_holiday'] = dates_py.map(is_eve_of_holiday).astype(bool)
+        self.enriched_data['is_payday'] = dates_py.map(is_payday).astype(bool)
 
         logger.info("Variables temporelles ajoutées")
         return self.enriched_data
@@ -350,6 +369,56 @@ class DataEnrichmentPipeline:
         logger.info("Features DMQ ajoutées")
         return self.enriched_data
 
+    def add_dmq_per_coupure_features(self) -> pd.DataFrame:
+        """Crée les colonnes ``dmq_<c>`` pour chaque coupure.
+
+        Définition : ``DMQ_<c>(t)`` = moyenne sur 28 jours glissants des
+        **baisses** quotidiennes de ``solde_<c>`` (consommation observée),
+        calculée par ATM. Un ``shift(1)`` est appliqué pour que la valeur à
+        la date t ne dépende que du passé strict (pas de leakage).
+
+        Ces colonnes sont produites comme **signaux d'entrée** pour le
+        ``CommandPipeline`` (cf. ``pipeline.py`` / ``_default_dmq_provider``)
+        et comme targets possibles pour ``CatBoostDmqForecaster``.
+        """
+        logger.info("Ajout des features DMQ par coupure (dmq_5..100)...")
+
+        if self.enriched_data is None:
+            raise ValueError("Exécutez add_temporal_features() d'abord")
+
+        df = self.enriched_data.sort_values(
+            [ColumnNames.ATM_ID, ColumnNames.ORDER_DATE]
+        ).reset_index(drop=True)
+
+        for c in COUPURES:
+            sol_col = SOLDES_BY_COUPURE[c]
+            dmq_col = DMQ_BY_COUPURE[c]
+
+            if sol_col not in df.columns:
+                logger.warning(
+                    f"  Colonne {sol_col} absente : {dmq_col} mis à 0.0"
+                )
+                df[dmq_col] = 0.0
+                continue
+
+            # Baisses quotidiennes = diff négative (clippée à 0)
+            diffs = df.groupby(ColumnNames.ATM_ID)[sol_col].diff()
+            baisses = (-diffs).clip(lower=0)
+
+            # Moyenne glissante 28j, shift(1) pour éviter toute fuite
+            df[dmq_col] = (
+                baisses.groupby(df[ColumnNames.ATM_ID])
+                .transform(
+                    lambda s: s.shift(1).rolling(window=28, min_periods=3).mean()
+                )
+                .fillna(0.0)
+                .round(2)
+            )
+
+        self.enriched_data = df
+        logger.info(f"  5 colonnes DMQ par coupure ajoutées : {list(DMQ_BY_COUPURE.values())}")
+        return self.enriched_data
+
     def save_enriched_data(self, output_path: Optional[Path] = None) -> Path:
         """Sauvegarde les données enrichies."""
         if self.enriched_data is None:
@@ -420,6 +489,12 @@ class DataEnrichmentPipeline:
             self.add_dmq_features()
             if save_snapshots:
                 self.save_intermediate_snapshot(self.enriched_data, "05b_dmq")
+
+            # ÉTAPE 5c : DMQ par coupure (dmq_5..100)
+            logger.info("\nÉTAPE 5c : Features DMQ par coupure...")
+            self.add_dmq_per_coupure_features()
+            if save_snapshots:
+                self.save_intermediate_snapshot(self.enriched_data, "05c_dmq_per_coupure")
 
             # ÉTAPE 6 : Sauvegarde
             if save_output:

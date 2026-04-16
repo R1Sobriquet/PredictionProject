@@ -30,6 +30,12 @@ from .config import (
     get_training_date_range,
     get_file_path,
 )
+from .holidays import (
+    is_french_holiday,
+    is_eve_of_holiday,
+    is_payday,
+    french_holidays,
+)
 
 __all__ = [
     'ColumnNames',
@@ -57,4 +63,8 @@ __all__ = [
     'NB_CASSETTES_COLUMNS',
     'get_training_date_range',
     'get_file_path',
+    'is_french_holiday',
+    'is_eve_of_holiday',
+    'is_payday',
+    'french_holidays',
 ]
