@@ -464,6 +464,19 @@ class CommandConfig:
         100: _env_int('CMD_SEUIL_MAX_100', 2500),
     }
 
+    # Nombre de cassettes par défaut, utilisé quand la colonne
+    # `nb_cassettes_<c>` est absente des données HFSQL MAIS que l'historique
+    # montre qu'une coupure a déjà été servie (solde > 0). Permet d'éviter
+    # que toutes les cassettes soient marquées HS (→ 0 billets → commande
+    # supprimée par le seuil MIN_COMMAND_AMOUNT).
+    DEFAULT_NB_CASSETTES_PAR_COUPURE: Dict[int, int] = {
+        5: _env_int('CMD_DEFAULT_NB_CASSETTES_5', 1),
+        10: _env_int('CMD_DEFAULT_NB_CASSETTES_10', 1),
+        20: _env_int('CMD_DEFAULT_NB_CASSETTES_20', 1),
+        50: _env_int('CMD_DEFAULT_NB_CASSETTES_50', 1),
+        100: _env_int('CMD_DEFAULT_NB_CASSETTES_100', 1),
+    }
+
     # Détection K7 HS (étape 0)
     K7HS_WINDOW_DAYS: int = _env_int('CMD_K7HS_WINDOW_DAYS', 15)
     K7HS_STALE_DAYS: int = _env_int('CMD_K7HS_STALE_DAYS', 3)

@@ -100,11 +100,74 @@ class CommandDecision:
         return row
 
 
-def _extract_atm_config(row: pd.Series) -> AtmConfig:
-    """Lit la configuration d'un ATM depuis une ligne DataFrame."""
-    nb_cassettes = {
-        c: int(row.get(NB_CASSETTES_BY_COUPURE[c], 0) or 0) for c in COUPURES
-    }
+def _infer_nb_cassettes(
+    row: pd.Series,
+    history: Optional[pd.DataFrame] = None,
+) -> Dict[int, int]:
+    """Détermine le nombre de cassettes par coupure pour un ATM.
+
+    Stratégie de fallback (les exports HFSQL ne contiennent pas toujours les
+    colonnes ``nb_cassettes_<c>``) :
+
+    1. Si la colonne ``nb_cassettes_<c>`` existe et est > 0 → on utilise sa
+       valeur directe.
+    2. Sinon, si la coupure a déjà eu un solde > 0 dans l'historique de
+       l'ATM (ou en l'absence d'historique, dans la ligne courante) →
+       ``DEFAULT_NB_CASSETTES_PAR_COUPURE[c]`` (1 par défaut, surchargeable
+       via ``CMD_DEFAULT_NB_CASSETTES_<c>``).
+    3. Sinon → 0 (la coupure n'est pas servie par cet ATM, marquée K7 HS).
+    """
+    nb_cassettes: Dict[int, int] = {}
+    # ``row.index`` permet de distinguer :
+    #   - colonne ABSENTE  → on infère (cas HFSQL réel sans nb_cassettes_*)
+    #   - colonne PRÉSENTE → on respecte la valeur (même si 0 = ATM sans
+    #     cette coupure, intention explicite des données ou des tests)
+    row_columns = set(row.index)
+    for c in COUPURES:
+        cassette_col = NB_CASSETTES_BY_COUPURE[c]
+        if cassette_col in row_columns:
+            raw_value = row.get(cassette_col, 0)
+            try:
+                nb_cassettes[c] = max(0, int(raw_value or 0))
+            except (TypeError, ValueError):
+                nb_cassettes[c] = 0
+            continue
+
+        # Fallback : colonne absente → inférence à partir du solde
+        # (historique + ligne courante).
+        sol_col = SOLDES_BY_COUPURE[c]
+        served = False
+        if history is not None and not history.empty and sol_col in history.columns:
+            try:
+                served = bool((history[sol_col].fillna(0) > 0).any())
+            except (TypeError, ValueError):
+                served = False
+        if not served:
+            try:
+                served = float(row.get(sol_col, 0.0) or 0.0) > 0
+            except (TypeError, ValueError):
+                served = False
+
+        if served:
+            nb_cassettes[c] = int(
+                CommandConfig.DEFAULT_NB_CASSETTES_PAR_COUPURE.get(c, 1)
+            )
+        else:
+            nb_cassettes[c] = 0
+    return nb_cassettes
+
+
+def _extract_atm_config(
+    row: pd.Series,
+    history: Optional[pd.DataFrame] = None,
+) -> AtmConfig:
+    """Lit la configuration d'un ATM depuis une ligne DataFrame.
+
+    ``history`` (optionnel) permet d'inférer le nombre de cassettes quand la
+    colonne dédiée est absente des données HFSQL — voir
+    :func:`_infer_nb_cassettes`.
+    """
+    nb_cassettes = _infer_nb_cassettes(row, history)
     return AtmConfig(
         atm_id=int(row[ColumnNames.ATM_ID]),
         nb_cassettes_par_coupure=nb_cassettes,
@@ -237,11 +300,13 @@ class CommandPipeline:
         decisions: List[CommandDecision] = []
 
         for _, row in current_data.iterrows():
-            atm_cfg = _extract_atm_config(row)
+            atm_id_for_history = int(row[ColumnNames.ATM_ID])
+            atm_history = history_by_atm.get(atm_id_for_history, pd.DataFrame())
+            atm_cfg = _extract_atm_config(row, history=atm_history)
             decision = self._process_single(
                 row=row,
                 atm_cfg=atm_cfg,
-                history=history_by_atm.get(atm_cfg.atm_id, pd.DataFrame()),
+                history=atm_history,
                 dmq_provider=dmq_provider,
                 day_commande=day_commande,
                 day_livraison=day_livraison,
