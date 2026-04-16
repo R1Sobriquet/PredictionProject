@@ -15,7 +15,7 @@ Features :
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 import logging
 from pathlib import Path
 import warnings
@@ -64,6 +64,14 @@ class CatBoostForecaster(BaselineModel):
 
     SHORT_TERM_THRESHOLD = 14
 
+    # Presets prêts à l'emploi. Passer ``preset=`` au constructeur surcharge
+    # iterations/learning_rate/depth ; les autres kwargs restent actifs.
+    PRESETS: Dict[str, Dict[str, Any]] = {
+        'fast':    {'iterations': 1500, 'learning_rate': 0.05, 'depth': 6},
+        'default': {'iterations': 4000, 'learning_rate': 0.03, 'depth': 6},
+        'deep':    {'iterations': 6000, 'learning_rate': 0.02, 'depth': 8},
+    }
+
     def __init__(
         self,
         max_horizon: int = 90,
@@ -78,11 +86,24 @@ class CatBoostForecaster(BaselineModel):
         rsm: float = 0.85,
         loss_function: str = 'MAE',
         bootstrap_type: str = 'Bernoulli',
+        preset: Optional[str] = None,
     ):
         super().__init__(f"CatBoost_H{max_horizon}")
 
         if not CATBOOST_AVAILABLE:
             raise ImportError("CatBoost n'est pas installé.")
+
+        # Application du preset si fourni
+        if preset is not None:
+            if preset not in self.PRESETS:
+                raise ValueError(
+                    f"Preset inconnu '{preset}'. Choix : {list(self.PRESETS)}"
+                )
+            cfg = self.PRESETS[preset]
+            iterations = cfg['iterations']
+            learning_rate = cfg['learning_rate']
+            depth = cfg['depth']
+            logger.info(f"CatBoost preset '{preset}' appliqué : {cfg}")
 
         self.max_horizon = max_horizon
         self.iterations = iterations
@@ -732,8 +753,14 @@ def train_and_evaluate_catboost(
     enriched_data: pd.DataFrame,
     max_horizon: int = 90,
     test_ratio: float = 0.2,
+    preset: Optional[str] = None,
 ) -> Tuple[CatBoostForecaster, pd.DataFrame]:
-    """Entraîne et évalue un modèle CatBoost."""
+    """Entraîne et évalue un modèle CatBoost.
+
+    Args:
+        preset: Nom d'un preset d'hyperparamètres
+            (``CatBoostForecaster.PRESETS``) ou ``None`` pour les défauts.
+    """
     logger.info("ENTRAÎNEMENT ET ÉVALUATION CATBOOST")
     logger.info("=" * 50)
 
@@ -747,7 +774,7 @@ def train_and_evaluate_catboost(
     logger.info(f"  Train : {len(train_data)} lignes jusqu'au {split_date.date()}")
     logger.info(f"  Test  : {len(test_data)} lignes à partir du {split_date.date()}")
 
-    model = CatBoostForecaster(max_horizon=max_horizon)
+    model = CatBoostForecaster(max_horizon=max_horizon, preset=preset)
     model.fit(train_data)
 
     results = model.evaluate_by_horizon(test_data)

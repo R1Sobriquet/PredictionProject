@@ -28,6 +28,7 @@ from src import (
 from src.data_processing import analyze_atm_pattern
 from src.models.baseline import create_baseline_suite, evaluate_all_baselines
 from src.models.catboost_model import CatBoostForecaster, train_and_evaluate_catboost
+from src.models.evaluation import time_series_cv
 from src.commande import CommandPipeline
 from src.utils import ColumnNames, get_file_path, Messages
 
@@ -138,8 +139,12 @@ def run_analysis_step() -> bool:
         return False
 
 
-def run_baselines_step() -> bool:
-    """Entraînement et évaluation des modèles de baseline."""
+def run_baselines_step(cv: str = 'simple') -> bool:
+    """Entraînement et évaluation des modèles de baseline.
+
+    Args:
+        cv: 'simple' (split 90/10) ou 'timeseries' (3-fold expansif).
+    """
     logger.info("ENTRAÎNEMENT DES MODÈLES DE BASELINE")
     logger.info("=" * 60)
 
@@ -155,7 +160,53 @@ def run_baselines_step() -> bool:
             date_format='%Y-%m-%d',
         )
 
-        # Division train/test temporelle (90/10)
+        output_dir = Path("data/output")
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        baselines = create_baseline_suite()
+        logger.info(f"  Modèles : {[b.name for b in baselines]}")
+
+        if cv == 'timeseries':
+            logger.info("  Stratégie CV : TimeSeriesSplit 3-fold expansif")
+            all_rows = []
+            # Pour chaque baseline : utilise create_baseline_suite() comme
+            # factory — évite d'introspecter les signatures __init__ variables.
+            for baseline_idx, baseline in enumerate(baselines):
+                factory = lambda i=baseline_idx: create_baseline_suite()[i]
+                cv_df = time_series_cv(factory, enriched_data, n_splits=3)
+                if cv_df.empty:
+                    logger.warning(f"  {baseline.name} : CV vide, skip")
+                    continue
+                cv_df.insert(0, 'model', baseline.name)
+                all_rows.append(cv_df)
+                mean_mae = cv_df['mae'].mean()
+                std_mae = cv_df['mae'].std()
+                logger.info(
+                    f"  {baseline.name}: MAE {mean_mae:.2f} ± {std_mae:.2f} "
+                    f"(sur {len(cv_df)} folds)"
+                )
+
+            if not all_rows:
+                logger.error("Aucun fold exploitable.")
+                return False
+            results_df = pd.concat(all_rows, ignore_index=True)
+            output_file = output_dir / "baseline_results_cv.csv"
+            results_df.to_csv(output_file, index=False)
+            logger.info(f"Résultats CV sauvegardés : {output_file}")
+
+            # Podium basé sur la MAE moyenne
+            ranking = (
+                results_df.groupby('model')['mae']
+                .agg(['mean', 'std'])
+                .sort_values('mean')
+            )
+            logger.info("=" * 60)
+            logger.info("PODIUM BASELINES (MAE moyenne sur 3 folds) :")
+            for i, (model, row) in enumerate(ranking.head(3).iterrows()):
+                logger.info(f"  {i + 1}. {model}: MAE={row['mean']:.2f} ± {row['std']:.2f}")
+            return True
+
+        # Split simple (défaut) : 90/10 temporel
         sorted_dates = sorted(enriched_data[ColumnNames.ORDER_DATE].unique())
         test_days = max(7, len(sorted_dates) // 10)
         split_date = sorted_dates[-test_days]
@@ -166,12 +217,9 @@ def run_baselines_step() -> bool:
         logger.info(f"  Train : {len(train_data)} lignes ({len(sorted_dates) - test_days} jours)")
         logger.info(f"  Test  : {len(test_data)} lignes ({test_days} jours)")
 
-        baselines = create_baseline_suite()
-        logger.info(f"  Modèles : {[b.name for b in baselines]}")
-
         results_df = evaluate_all_baselines(baselines, train_data, test_data)
 
-        output_file = Path("data/output/baseline_results.csv")
+        output_file = output_dir / "baseline_results.csv"
         results_df.to_csv(output_file, index=False)
         logger.info(f"Résultats sauvegardés : {output_file}")
 
@@ -188,8 +236,18 @@ def run_baselines_step() -> bool:
         return False
 
 
-def run_catboost_step(max_horizon: int = 90) -> bool:
-    """Entraînement et évaluation du modèle CatBoost."""
+def run_catboost_step(
+    max_horizon: int = 90,
+    cv: str = 'simple',
+    preset: str = 'default',
+) -> bool:
+    """Entraînement et évaluation du modèle CatBoost.
+
+    Args:
+        max_horizon: Horizon max pour la prévision multi-horizon.
+        cv: 'simple' (split 90/10) ou 'timeseries' (3-fold expansif).
+        preset: Preset d'hyperparamètres ('fast' | 'default' | 'deep').
+    """
     logger.info("ENTRAÎNEMENT DU MODÈLE CATBOOST")
     logger.info("=" * 60)
 
@@ -207,12 +265,38 @@ def run_catboost_step(max_horizon: int = 90) -> bool:
 
         logger.info(f"  Données chargées : {len(enriched_data)} lignes")
 
-        model, results_by_horizon = train_and_evaluate_catboost(
-            enriched_data, max_horizon=max_horizon, test_ratio=0.2,
-        )
-
         output_dir = Path("data/output")
         output_dir.mkdir(parents=True, exist_ok=True)
+
+        if cv == 'timeseries':
+            logger.info(
+                f"  Stratégie CV : TimeSeriesSplit 3-fold expansif (preset='{preset}')"
+            )
+            factory = lambda: CatBoostForecaster(max_horizon=max_horizon, preset=preset)
+            cv_df = time_series_cv(factory, enriched_data, n_splits=3, horizon=1)
+            if cv_df.empty:
+                logger.error("Aucun fold exploitable.")
+                return False
+            cv_df.insert(0, 'model', f'CatBoost_H{max_horizon}')
+            cv_df.to_csv(output_dir / "catboost_results_cv.csv", index=False)
+            mean_mae = cv_df['mae'].mean()
+            std_mae = cv_df['mae'].std()
+            logger.info("=" * 60)
+            logger.info(
+                f"CatBoost (3-fold TS) : MAE {mean_mae:.2f} ± {std_mae:.2f}"
+            )
+            for _, row in cv_df.iterrows():
+                logger.info(
+                    f"  fold {int(row['fold'])}: MAE={row['mae']:.2f}, "
+                    f"RMSE={row['rmse']:.2f}"
+                )
+            return True
+
+        # Split simple (défaut)
+        logger.info(f"  Preset CatBoost : '{preset}'")
+        model, results_by_horizon = train_and_evaluate_catboost(
+            enriched_data, max_horizon=max_horizon, test_ratio=0.2, preset=preset,
+        )
 
         results_by_horizon.to_csv(output_dir / "catboost_results_by_horizon.csv", index=False)
         model.save_model(output_dir / "catboost_model")
@@ -462,6 +546,21 @@ Exemples d'utilisation :
         help="(étape command) Date de livraison/chargement, format YYYY-MM-DD",
     )
 
+    parser.add_argument(
+        '--cv',
+        choices=['simple', 'timeseries'],
+        default='simple',
+        help="Stratégie de validation pour baselines/catboost : 'simple' (split "
+             "temporel 90/10, défaut) ou 'timeseries' (3-fold expansif).",
+    )
+
+    parser.add_argument(
+        '--catboost-preset',
+        choices=['fast', 'default', 'deep'],
+        default='default',
+        help="(étape catboost) Preset d'hyperparamètres CatBoost.",
+    )
+
     args = parser.parse_args()
 
     if not args.step and not args.atm:
@@ -484,9 +583,9 @@ Exemples d'utilisation :
         elif args.step == 'analysis':
             success = run_analysis_step()
         elif args.step == 'baselines':
-            success = run_baselines_step()
+            success = run_baselines_step(cv=args.cv)
         elif args.step == 'catboost':
-            success = run_catboost_step()
+            success = run_catboost_step(cv=args.cv, preset=args.catboost_preset)
         elif args.step == 'command':
             success = run_command_step(
                 day_commande=args.day_commande,

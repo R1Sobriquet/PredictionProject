@@ -159,17 +159,24 @@ def time_series_cv(
         y_true_list: List[float] = []
         y_pred_list: List[float] = []
 
+        # Détecte si le modèle accepte `horizon` (baselines = non, catboost = oui).
+        import inspect
+        predict_params = inspect.signature(model.predict).parameters
+        accepts_horizon = 'horizon' in predict_params
+
         # Itération simple : une prédiction par ligne de test.
         for _, row in test_df.iterrows():
             atm_id = int(row[ColumnNames.ATM_ID])
             pred_date = row[date_column]
             try:
-                pred = model.predict(
+                kwargs = dict(
                     atm_id=atm_id,
                     prediction_dates=[pred_date],
                     context_data=train_df,
-                    horizon=horizon,
-                )[0]
+                )
+                if accepts_horizon:
+                    kwargs['horizon'] = horizon
+                pred = model.predict(**kwargs)[0]
             except Exception as exc:  # pragma: no cover
                 logger.warning("CV fold %d: erreur predict ATM %s: %s", fold, atm_id, exc)
                 continue
