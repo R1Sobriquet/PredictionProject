@@ -284,6 +284,72 @@ class DataEnrichmentPipeline:
         logger.info("Variables saisonnières ajoutées")
         return self.enriched_data
 
+    def add_dmq_features(self) -> pd.DataFrame:
+        """Ajoute des features issues du DMQ (signal de consommation).
+
+        Features :
+        - ``dmq_volatilite``           : écart-type glissant 28 j du montant.
+        - ``dmq_trend_7j``             : pente d'une régression linéaire sur les
+                                         7 dernières observations (par ATM).
+        - ``dmq_trend_28j``            : pente sur 28 j.
+        - ``dmq_debut_mois_ratio``     : amount_jour / moyenne_28j (via shift(1))
+        - ``soldes_ratio_total``       : total_soldes / montant_assurance si dispo
+
+        Note : ne nécessite pas l'ajout de colonnes cibles DMQ par coupure — ces
+        features sont des **signaux d'entrée** pour le modèle. Les DMQ par
+        coupure (``dmq_5/10/...``) sont produits séparément (voir config +
+        pipeline).
+        """
+        logger.info("Ajout des features DMQ (volatilité + tendances)...")
+
+        if self.enriched_data is None:
+            raise ValueError("Exécutez add_temporal_features() d'abord")
+
+        df = self.enriched_data
+        gb = df.groupby(ColumnNames.ATM_ID)[ColumnNames.AMOUNT]
+
+        # Volatilité (écart-type) des montants sur les 28 dernières commandes
+        df['dmq_volatilite'] = gb.transform(
+            lambda x: x.shift(1).rolling(window=28, min_periods=2).std()
+        ).fillna(0).round(2)
+
+        # Pente (tendance) sur 7 et 28 jours via une régression linéaire simple
+        def _slope(series: pd.Series) -> float:
+            y = series.dropna().to_numpy(dtype=float)
+            if len(y) < 2:
+                return 0.0
+            x = np.arange(len(y), dtype=float)
+            # polyfit degré 1 : retourne [pente, intercept]
+            try:
+                slope = np.polyfit(x, y, 1)[0]
+            except (np.linalg.LinAlgError, ValueError):
+                return 0.0
+            return float(slope)
+
+        df['dmq_trend_7j'] = gb.transform(
+            lambda x: x.shift(1).rolling(window=7, min_periods=2).apply(_slope, raw=False)
+        ).fillna(0).round(2)
+
+        df['dmq_trend_28j'] = gb.transform(
+            lambda x: x.shift(1).rolling(window=28, min_periods=2).apply(_slope, raw=False)
+        ).fillna(0).round(2)
+
+        # Ratio "amount du jour vs moyenne glissante" — signal début de mois
+        rolling_mean_28 = gb.transform(
+            lambda x: x.shift(1).rolling(window=28, min_periods=1).mean()
+        )
+        safe_mean = rolling_mean_28.replace(0, np.nan)
+        df['dmq_debut_mois_ratio'] = (df[ColumnNames.AMOUNT] / safe_mean).fillna(1.0).round(3)
+
+        # Ratio de remplissage des soldes (si colonnes dispo)
+        if 'total_soldes' in df.columns and ColumnNames.INSURANCE_AMOUNT in df.columns:
+            denom = df[ColumnNames.INSURANCE_AMOUNT].replace(0, np.nan)
+            df['soldes_ratio_assurance'] = (df['total_soldes'] / denom).fillna(0).round(3)
+
+        self.enriched_data = df
+        logger.info("Features DMQ ajoutées")
+        return self.enriched_data
+
     def save_enriched_data(self, output_path: Optional[Path] = None) -> Path:
         """Sauvegarde les données enrichies."""
         if self.enriched_data is None:
@@ -348,6 +414,12 @@ class DataEnrichmentPipeline:
             self.add_seasonal_features()
             if save_snapshots:
                 self.save_intermediate_snapshot(self.enriched_data, "05_seasonal")
+
+            # ÉTAPE 5b : Features DMQ (volatilité, tendance, ratios)
+            logger.info("\nÉTAPE 5b : Features DMQ...")
+            self.add_dmq_features()
+            if save_snapshots:
+                self.save_intermediate_snapshot(self.enriched_data, "05b_dmq")
 
             # ÉTAPE 6 : Sauvegarde
             if save_output:

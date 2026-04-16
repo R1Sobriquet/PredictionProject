@@ -21,6 +21,8 @@ from .baseline import (
 
 from .catboost_model import (
     CatBoostForecaster,
+    CatBoostDmqForecaster,
+    MultiCoupureForecaster,
     train_and_evaluate_catboost,
 )
 
@@ -36,5 +38,7 @@ __all__ = [
     'create_baseline_suite',
     'evaluate_all_baselines',
     'CatBoostForecaster',
+    'CatBoostDmqForecaster',
+    'MultiCoupureForecaster',
     'train_and_evaluate_catboost',
 ]

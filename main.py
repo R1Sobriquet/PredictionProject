@@ -8,6 +8,7 @@ Usage :
     python main.py --step analysis          # Analyse et visualisations
     python main.py --step baselines         # Entraînement des baselines
     python main.py --step catboost          # Entraînement CatBoost
+    python main.py --step command           # Moteur de commande par coupure
     python main.py --step all               # Pipeline complet
     python main.py --atm 123               # Analyse d'un ATM spécifique
 """
@@ -27,6 +28,7 @@ from src import (
 from src.data_processing import analyze_atm_pattern
 from src.models.baseline import create_baseline_suite, evaluate_all_baselines
 from src.models.catboost_model import CatBoostForecaster, train_and_evaluate_catboost
+from src.commande import CommandPipeline
 from src.utils import ColumnNames, get_file_path, Messages
 
 # Configuration du logging
@@ -234,6 +236,101 @@ def run_catboost_step(max_horizon: int = 90) -> bool:
         return False
 
 
+def run_command_step(
+    day_commande: str = None,
+    day_livraison: str = None,
+) -> bool:
+    """Étape 6 : Moteur de commande déterministe par coupure.
+
+    Applique les 6 étapes documentées (K7 HS → Assurance agence) et produit
+    un fichier avec 5 valeurs ``predictif_*`` par automate + le flag
+    ``is_command`` (True dès qu'une coupure est > 0).
+    """
+    logger.info("MOTEUR DE COMMANDE DÉTERMINISTE PAR COUPURE")
+    logger.info("=" * 60)
+
+    try:
+        enriched_file = get_file_path('enriched')
+        if not enriched_file.exists():
+            logger.error("Fichier enrichi non trouvé. Exécutez les étapes précédentes.")
+            return False
+
+        enriched_data = pd.read_csv(
+            enriched_file,
+            parse_dates=[ColumnNames.ORDER_DATE],
+            date_format='%Y-%m-%d',
+        )
+        logger.info(f"  Données chargées : {len(enriched_data)} lignes")
+
+        # Snapshot = dernière ligne par ATM (= état courant à la date de commande)
+        enriched_data = enriched_data.sort_values(
+            [ColumnNames.ATM_ID, ColumnNames.ORDER_DATE]
+        )
+        current_data = (
+            enriched_data
+            .groupby(ColumnNames.ATM_ID, as_index=False)
+            .tail(1)
+            .reset_index(drop=True)
+        )
+        logger.info(f"  Snapshot : {len(current_data)} automates")
+
+        # Dates : si non fournies, on prend la date la plus récente + 3 j pour
+        # la livraison.
+        if day_commande:
+            day_cmd = pd.Timestamp(day_commande).date()
+        else:
+            day_cmd = pd.Timestamp(current_data[ColumnNames.ORDER_DATE].max()).date()
+        if day_livraison:
+            day_liv = pd.Timestamp(day_livraison).date()
+        else:
+            from datetime import timedelta as _td
+            day_liv = day_cmd + _td(days=3)
+
+        logger.info(f"  Jour commande  : {day_cmd}")
+        logger.info(f"  Jour livraison : {day_liv}")
+
+        pipeline = CommandPipeline()
+        result = pipeline.run(
+            current_data=current_data,
+            historical_data=enriched_data,
+            day_commande=day_cmd,
+            day_livraison=day_liv,
+        )
+
+        output_dir = Path("data/output")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_file = output_dir / "commandes_predictives.csv"
+        result.to_csv(output_file, index=False)
+        logger.info(f"Résultats sauvegardés : {output_file}")
+
+        logger.info("=" * 60)
+        logger.info("RÉSUMÉ DU MOTEUR DE COMMANDE :")
+        logger.info(f"  Automates traités       : {len(result)}")
+        logger.info(f"  Commandes générées      : {int(result[ColumnNames.IS_COMMAND].sum())}")
+        logger.info(
+            f"  Commandes exceptionnelles : "
+            f"{int(result[ColumnNames.IS_COMMAND_EXCEPTIONNELLE].sum())}"
+        )
+        logger.info(
+            f"  Alertes risque vide     : "
+            f"{int(result[ColumnNames.ALERTE_RISQUE_VIDE].sum())}"
+        )
+        logger.info(
+            f"  Commandes supprimées    : "
+            f"{int(result[ColumnNames.ALERTE_COMMANDE_SUPPRIMEE].sum())}"
+        )
+        if 'montant_total' in result.columns:
+            logger.info(f"  Montant total global    : {int(result['montant_total'].sum())} €")
+
+        return True
+
+    except Exception as e:
+        logger.error(f"ERREUR MOTEUR DE COMMANDE : {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
 def analyze_specific_atm(atm_id: int) -> bool:
     """Analyse détaillée d'un ATM spécifique."""
     logger.info(f"ANALYSE DÉTAILLÉE DE L'ATM {atm_id}")
@@ -341,7 +438,7 @@ Exemples d'utilisation :
 
     parser.add_argument(
         '--step',
-        choices=['ingestion', 'enrichment', 'analysis', 'baselines', 'catboost', 'all'],
+        choices=['ingestion', 'enrichment', 'analysis', 'baselines', 'catboost', 'command', 'all'],
         help="Étape du pipeline à exécuter",
     )
 
@@ -349,6 +446,20 @@ Exemples d'utilisation :
         '--atm',
         type=int,
         help="ID d'ATM pour une analyse détaillée",
+    )
+
+    parser.add_argument(
+        '--day-commande',
+        type=str,
+        default=None,
+        help="(étape command) Date de commande, format YYYY-MM-DD",
+    )
+
+    parser.add_argument(
+        '--day-livraison',
+        type=str,
+        default=None,
+        help="(étape command) Date de livraison/chargement, format YYYY-MM-DD",
     )
 
     args = parser.parse_args()
@@ -376,6 +487,11 @@ Exemples d'utilisation :
             success = run_baselines_step()
         elif args.step == 'catboost':
             success = run_catboost_step()
+        elif args.step == 'command':
+            success = run_command_step(
+                day_commande=args.day_commande,
+                day_livraison=args.day_livraison,
+            )
         elif args.step == 'all':
             success = run_full_pipeline()
 

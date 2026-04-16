@@ -174,6 +174,39 @@ class ColumnNames:
     STD_ORDER_AMOUNT = "std_order_amount"
     ORDER_COUNT_LAST_30D = "order_count_last_30d"
 
+    # --- Colonnes produites par le moteur de commande déterministe ---
+    # Valeurs prédictives par coupure (sortie de CommandPipeline)
+    PREDICTIF_5 = "predictif_5"
+    PREDICTIF_10 = "predictif_10"
+    PREDICTIF_20 = "predictif_20"
+    PREDICTIF_50 = "predictif_50"
+    PREDICTIF_100 = "predictif_100"
+
+    # DMQ par coupure (consommation quotidienne moyenne)
+    DMQ_5 = "dmq_5"
+    DMQ_10 = "dmq_10"
+    DMQ_20 = "dmq_20"
+    DMQ_50 = "dmq_50"
+    DMQ_100 = "dmq_100"
+
+    # Configuration automate
+    NB_CASSETTES_5 = "nb_cassettes_5"
+    NB_CASSETTES_10 = "nb_cassettes_10"
+    NB_CASSETTES_20 = "nb_cassettes_20"
+    NB_CASSETTES_50 = "nb_cassettes_50"
+    NB_CASSETTES_100 = "nb_cassettes_100"
+    NB_CONTENEURS = "nb_conteneurs"
+    INSURANCE_AMOUNT = "insurance_amount"
+    MODE_LIVRAISON = "mode_livraison"      # "axytrans" ou autre
+    MODE_CHARGEMENT = "mode_chargement"    # "clic-clac" ou "complement"
+
+    # Flags de sortie
+    IS_COMMAND = "is_command"
+    IS_COMMAND_EXCEPTIONNELLE = "is_command_exceptionnelle"
+    ALERTE_COMMANDE_SUPPRIMEE = "alerte_commande_supprimee"
+    ALERTE_RISQUE_VIDE = "alerte_risque_vide"
+    ALERTE_COMMANDE_PRECEDENTE_NON_CHARGEE = "alerte_commande_precedente_non_chargee"
+
 
 # ===== LISTE DES COLONNES À CHARGER =====
 # Uniquement les colonnes pertinentes (~25 sur 51)
@@ -282,6 +315,50 @@ K7HS_COLUMNS = [
     ColumnNames.K7HS_50, ColumnNames.K7HS_100,
 ]
 
+# Ordre canonique des coupures billets (utilisé par tout le moteur de commande)
+COUPURES = [5, 10, 20, 50, 100]
+
+# Mapping coupure → nom de colonne standardisé
+SOLDES_BY_COUPURE: Dict[int, str] = {
+    5: ColumnNames.SOLDES_5,
+    10: ColumnNames.SOLDES_10,
+    20: ColumnNames.SOLDES_20,
+    50: ColumnNames.SOLDES_50,
+    100: ColumnNames.SOLDES_100,
+}
+K7HS_BY_COUPURE: Dict[int, str] = {
+    5: ColumnNames.K7HS_5,
+    10: ColumnNames.K7HS_10,
+    20: ColumnNames.K7HS_20,
+    50: ColumnNames.K7HS_50,
+    100: ColumnNames.K7HS_100,
+}
+DMQ_BY_COUPURE: Dict[int, str] = {
+    5: ColumnNames.DMQ_5,
+    10: ColumnNames.DMQ_10,
+    20: ColumnNames.DMQ_20,
+    50: ColumnNames.DMQ_50,
+    100: ColumnNames.DMQ_100,
+}
+PREDICTIF_BY_COUPURE: Dict[int, str] = {
+    5: ColumnNames.PREDICTIF_5,
+    10: ColumnNames.PREDICTIF_10,
+    20: ColumnNames.PREDICTIF_20,
+    50: ColumnNames.PREDICTIF_50,
+    100: ColumnNames.PREDICTIF_100,
+}
+NB_CASSETTES_BY_COUPURE: Dict[int, str] = {
+    5: ColumnNames.NB_CASSETTES_5,
+    10: ColumnNames.NB_CASSETTES_10,
+    20: ColumnNames.NB_CASSETTES_20,
+    50: ColumnNames.NB_CASSETTES_50,
+    100: ColumnNames.NB_CASSETTES_100,
+}
+
+PREDICTIF_COLUMNS = list(PREDICTIF_BY_COUPURE.values())
+DMQ_COLUMNS = list(DMQ_BY_COUPURE.values())
+NB_CASSETTES_COLUMNS = list(NB_CASSETTES_BY_COUPURE.values())
+
 
 # ===== CONFIGURATION SOURCE DE DONNÉES =====
 class DataSourceConfig:
@@ -337,6 +414,79 @@ class DataSourceConfig:
                 'type': 'Excel (.xlsx)',
                 'path': cls.CSV_FILE_PATH,
             }
+
+
+# ===== PARAMÈTRES MÉTIER DU MOTEUR DE COMMANDE =====
+# Constantes issues de la documentation PredikATM (module 4.1 — Commande de fonds).
+# Tous les seuils sont surchargeables via variables d'environnement.
+
+
+def _env_int(key: str, default: int) -> int:
+    try:
+        return int(os.getenv(key, str(default)))
+    except ValueError:
+        return default
+
+
+def _env_float(key: str, default: float) -> float:
+    try:
+        return float(os.getenv(key, str(default)))
+    except ValueError:
+        return default
+
+
+class CommandConfig:
+    """Configuration métier du moteur de commande déterministe.
+
+    Toutes ces valeurs peuvent être surchargées via le fichier `.env`.
+    Les défauts reproduisent la documentation PredikATM (étapes 0 à 6).
+    """
+
+    # Montant minimum pour qu'une commande soit conservée (étape 3, 1ère vérif)
+    MIN_COMMAND_AMOUNT: float = _env_float('CMD_MIN_AMOUNT', 2_000.0)
+
+    # Caps Axytrans (étape 3, 2e vérif — mode de livraison Axytrans)
+    AXYTRANS_MAX_EUR: float = _env_float('CMD_AXYTRANS_MAX_EUR', 75_000.0)
+    AXYTRANS_MAX_BILLETS_PER_CONTAINER: int = _env_int(
+        'CMD_AXYTRANS_MAX_BILLETS_PER_CONTAINER', 2_600
+    )
+
+    # Cap global agence (étape 6)
+    INSURANCE_GLOBAL_CAP: float = _env_float('CMD_INSURANCE_GLOBAL_CAP', 300_000.0)
+
+    # Seuils maximaux de commande par coupure (billets/cassette)
+    # Utilisés dans la formule : nb_billets_max = seuil_max[c] * nb_cassettes[c]
+    SEUILS_MAX_PAR_COUPURE: Dict[int, int] = {
+        5: _env_int('CMD_SEUIL_MAX_5', 2500),
+        10: _env_int('CMD_SEUIL_MAX_10', 2500),
+        20: _env_int('CMD_SEUIL_MAX_20', 2500),
+        50: _env_int('CMD_SEUIL_MAX_50', 2500),
+        100: _env_int('CMD_SEUIL_MAX_100', 2500),
+    }
+
+    # Détection K7 HS (étape 0)
+    K7HS_WINDOW_DAYS: int = _env_int('CMD_K7HS_WINDOW_DAYS', 15)
+    K7HS_STALE_DAYS: int = _env_int('CMD_K7HS_STALE_DAYS', 3)
+
+    # Consommations DMQ (étapes 1 et 4)
+    # 2.5 jours de DMQ avant chargement (le chargement est anticipé)
+    DMQ_CONSO_JOURS_CHARGEMENT: float = _env_float('CMD_DMQ_CONSO_CHARGEMENT', 2.5)
+    # 3.0 jours pour la projection au soir après chargement
+    DMQ_CONSO_SOIR: float = _env_float('CMD_DMQ_CONSO_SOIR', 3.0)
+
+    # Source du DMQ : "ml" (via CatBoostDmqForecaster) ou "historical" (moyenne 28j)
+    DMQ_SOURCE: str = os.getenv('DMQ_SOURCE', 'historical').lower()
+
+    # Mode de livraison déclenchant les caps Axytrans
+    AXYTRANS_MODE_LIVRAISON: str = os.getenv('CMD_AXYTRANS_MODE', 'axytrans').lower()
+
+    # Mode de chargement "remplacement" (clic-clac) — remplit au max
+    CLIC_CLAC_MODE: str = os.getenv('CMD_CLIC_CLAC_MODE', 'clic-clac').lower()
+
+    @classmethod
+    def seuil_max(cls, coupure: int) -> int:
+        """Retourne le seuil maximal de commande pour une coupure donnée."""
+        return cls.SEUILS_MAX_PAR_COUPURE.get(coupure, 0)
 
 
 # ===== PARAMÈTRES TEMPORELS =====

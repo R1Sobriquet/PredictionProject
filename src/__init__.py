@@ -19,6 +19,7 @@ try:
         MovingAverageBaseline, WeekdayMeanBaseline, SeasonalNaiveBaseline,
         TrendBaseline, BaselineEnsemble,
     )
+    from .commande import CommandPipeline, CommandDecision, AtmConfig
 except ImportError:
     from src.data_ingestion import DataIngestionPipeline, quick_data_ingestion
     from src.data_processing import DataEnrichmentPipeline, quick_enrichment, analyze_atm_pattern
@@ -29,6 +30,7 @@ except ImportError:
         MovingAverageBaseline, WeekdayMeanBaseline, SeasonalNaiveBaseline,
         TrendBaseline, BaselineEnsemble,
     )
+    from src.commande import CommandPipeline, CommandDecision, AtmConfig
 
 __version__ = "2.0.0"
 __author__ = "Forecasting Team"
@@ -51,4 +53,7 @@ __all__ = [
     'SeasonalNaiveBaseline',
     'TrendBaseline',
     'BaselineEnsemble',
+    'CommandPipeline',
+    'CommandDecision',
+    'AtmConfig',
 ]

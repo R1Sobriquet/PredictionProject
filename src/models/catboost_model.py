@@ -67,12 +67,17 @@ class CatBoostForecaster(BaselineModel):
     def __init__(
         self,
         max_horizon: int = 90,
-        iterations: int = 4444,
-        learning_rate: float = 0.85,
+        iterations: int = 4000,
+        learning_rate: float = 0.03,
         depth: int = 6,
-        early_stopping_rounds: int = 66,
+        early_stopping_rounds: int = 100,
         random_state: int = 42,
         verbose: bool = False,
+        l2_leaf_reg: float = 3.0,
+        subsample: float = 0.85,
+        rsm: float = 0.85,
+        loss_function: str = 'MAE',
+        bootstrap_type: str = 'Bernoulli',
     ):
         super().__init__(f"CatBoost_H{max_horizon}")
 
@@ -93,11 +98,19 @@ class CatBoostForecaster(BaselineModel):
         self.atm_historical_stats = {}
         self.global_stats = {}
 
+        # Hyperparamètres tunés :
+        # - learning_rate 0.03 (vs 0.85) : convergence beaucoup plus stable
+        # - loss_function MAE : robuste aux outliers (queues épaisses des montants)
+        # - l2_leaf_reg + subsample/rsm : régularisation + bagging Bernoulli
         self.model_params = {
             'iterations': iterations,
             'learning_rate': learning_rate,
             'depth': depth,
-            'loss_function': 'RMSE',
+            'loss_function': loss_function,
+            'l2_leaf_reg': l2_leaf_reg,
+            'subsample': subsample,
+            'rsm': rsm,
+            'bootstrap_type': bootstrap_type,
             'random_seed': random_state,
             'verbose': verbose,
             'early_stopping_rounds': early_stopping_rounds,
@@ -580,6 +593,137 @@ class CatBoostForecaster(BaselineModel):
 
         logger.info(f"Modèle chargé : {path}")
         return instance
+
+
+# =============================================================================
+#  CatBoost DMQ par coupure
+# =============================================================================
+
+
+class CatBoostDmqForecaster(CatBoostForecaster):
+    """Variante de ``CatBoostForecaster`` qui prédit le **DMQ d'une coupure**
+    donnée au lieu du montant total ``amount``.
+
+    On instancie typiquement 5 modèles (un par coupure) via
+    :class:`MultiCoupureForecaster`.
+    """
+
+    def __init__(self, coupure: int, target_column: Optional[str] = None, **kwargs):
+        super().__init__(**kwargs)
+        self.coupure = int(coupure)
+        # Par défaut la colonne cible est ``dmq_{coupure}`` (cf. ColumnNames).
+        self.target_column = target_column or f"dmq_{self.coupure}"
+        self.name = f"CatBoostDMQ_{self.coupure}_H{self.max_horizon}"
+
+    def _prepare_features_for_training(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Même logique que la classe parente mais en lisant la target
+        configurée (``dmq_{coupure}``) au lieu de ``amount``."""
+        logger.info(
+            f"[{self.name}] Préparation features pour la coupure {self.coupure}€"
+        )
+
+        if self.target_column not in data.columns:
+            raise ValueError(
+                f"Colonne cible '{self.target_column}' absente des données. "
+                f"Colonnes disponibles : {list(data.columns)[:10]}..."
+            )
+
+        all_examples = []
+        data = data.sort_values([ColumnNames.ATM_ID, ColumnNames.ORDER_DATE]).reset_index(drop=True)
+
+        for atm_id in data[ColumnNames.ATM_ID].unique():
+            atm_data = data[data[ColumnNames.ATM_ID] == atm_id].reset_index(drop=True)
+            atm_stats = self.atm_historical_stats.get(atm_id, {})
+
+            for idx in range(len(atm_data) - 1):
+                base_row = atm_data.iloc[idx]
+
+                max_forward = min(len(atm_data) - idx - 1, self.max_horizon)
+                horizons = list(range(1, min(15, max_forward + 1)))
+                horizons += [h for h in [21, 30, 45, 60, 75, 90] if h <= max_forward]
+
+                for horizon in horizons:
+                    target_row = atm_data.iloc[idx + horizon]
+
+                    features = self._build_features(
+                        base_row=base_row,
+                        target_date=target_row[ColumnNames.ORDER_DATE],
+                        horizon=horizon,
+                        atm_stats=atm_stats,
+                        historical_data=atm_data.iloc[:idx + 1],
+                    )
+                    # Target = DMQ de la coupure (ex: dmq_5)
+                    features['target'] = float(target_row[self.target_column])
+                    all_examples.append(features)
+
+        training_df = pd.DataFrame(all_examples)
+        logger.info(
+            f"[{self.name}] {len(training_df)} exemples générés (target={self.target_column})"
+        )
+        return training_df
+
+
+class MultiCoupureForecaster:
+    """Wrapper qui entraîne un :class:`CatBoostDmqForecaster` par coupure et
+    expose une API de prédiction unifiée.
+
+    Produit un ``Dict[coupure, float]`` exploitable directement par
+    ``CommandPipeline`` (via un ``DmqProvider``).
+    """
+
+    def __init__(self, coupures: Optional[List[int]] = None, **kwargs):
+        self.coupures = coupures or [5, 10, 20, 50, 100]
+        self.models: Dict[int, CatBoostDmqForecaster] = {
+            c: CatBoostDmqForecaster(coupure=c, **kwargs) for c in self.coupures
+        }
+        self.is_fitted = False
+
+    def fit(self, data: pd.DataFrame, eval_data: Optional[pd.DataFrame] = None) -> 'MultiCoupureForecaster':
+        for coupure, model in self.models.items():
+            logger.info(f"=== Entraînement modèle coupure {coupure}€ ===")
+            model.fit(data, eval_data=eval_data)
+        self.is_fitted = True
+        return self
+
+    def predict_dmq_par_coupure(
+        self,
+        atm_id: int,
+        prediction_date: datetime,
+        context_data: Optional[pd.DataFrame] = None,
+        horizon: Optional[int] = None,
+    ) -> Dict[int, float]:
+        """Retourne un dict ``{coupure: dmq_prédit}`` pour un ATM et une date."""
+        if not self.is_fitted:
+            raise ValueError("MultiCoupureForecaster non entraîné.")
+
+        out: Dict[int, float] = {}
+        for coupure, model in self.models.items():
+            pred = model.predict(
+                atm_id=atm_id,
+                prediction_dates=[prediction_date],
+                context_data=context_data,
+                horizon=horizon,
+            )[0]
+            out[coupure] = float(max(0.0, pred))
+        return out
+
+    def as_dmq_provider(
+        self,
+        prediction_date: datetime,
+        context_data: Optional[pd.DataFrame] = None,
+        horizon: Optional[int] = None,
+    ):
+        """Adaptateur vers l'interface ``DmqProvider`` de ``CommandPipeline``."""
+
+        def _provider(atm_id: int) -> Dict[int, float]:
+            return self.predict_dmq_par_coupure(
+                atm_id=atm_id,
+                prediction_date=prediction_date,
+                context_data=context_data,
+                horizon=horizon,
+            )
+
+        return _provider
 
 
 # ===== FONCTIONS UTILITAIRES =====
