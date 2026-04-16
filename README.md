@@ -38,9 +38,15 @@ PredictionProject/
 │   ├── raw/                     # Fichiers Excel source
 │   ├── processed/               # Données nettoyées/enrichies
 │   └── output/                  # Résultats et modèles
-└── tests/
-    ├── test_commande.py         # 28 tests unitaires du moteur de commande
-    └── benchmark_dmq.py         # Benchmark précision ML vs baseline
+├── tests/
+│   ├── test_commande.py         # 28 tests unitaires du moteur de commande
+│   └── benchmark_dmq.py         # Benchmark précision ML vs baseline
+├── examples/
+│   └── catboost_example.py      # Exemple d'utilisation CatBoost
+└── scripts/
+    ├── generate_predictions.py  # Génère prédictions mensuelles/annuelles
+    ├── inspect_excel.py         # Outil d'inspection des Excel source
+    └── merge_commande_files.py  # Fusion de fichiers de commandes
 ```
 
 ## Stack Technique
@@ -181,11 +187,20 @@ Colonnes `DC_*` avec ~48 000 enregistrements sur 2026.
 - **Agrégats** : total soldes, total ajustements, total cassettes HS, cassettes actives
 - **Délais** : délai livraison, délai chargement
 - **Temporel** : weekday, weekend, mois, trimestre, encodage cyclique sin/cos
-- **DMQ** (`add_dmq_features()`, *nouvelle étape 5b*) :
+- **DMQ** (`add_dmq_features()`, *étape 5b*) :
   - `dmq_volatilite` : écart-type glissant 28 jours du DMQ
   - `dmq_trend_7j` / `dmq_trend_28j` : pente linéaire régressée sur N derniers jours
   - `dmq_debut_mois_ratio` : ratio DMQ du jour / DMQ moyen (cf. « DMQ de début de mois »)
   - `soldes_ratio_assurance` : indicateur de remplissage relatif à l'assurance agence
+- **DMQ par coupure** (`add_dmq_per_coupure_features()`, *étape 5c*) :
+  - `dmq_5`, `dmq_10`, `dmq_20`, `dmq_50`, `dmq_100` : moyenne glissante 28 j
+    des baisses quotidiennes de `solde_<c>` (consommation observée, `shift(1)`
+    pour éviter toute fuite). Utilisé comme signal d'entrée du moteur de
+    commande et comme target pour `CatBoostDmqForecaster`.
+- **Calendrier FR** (`src/utils/holidays.py`) :
+  - `is_holiday` : jour férié français métropolitain (11 jours légaux)
+  - `is_eve_holiday` : veille de férié (souvent un pic de consommation)
+  - `is_payday` : fin de mois (≥28) ou 5 du mois (paie / pensions)
 
 ## Modèles
 
@@ -272,11 +287,26 @@ python tests/benchmark_dmq.py
 **Critère de succès** : la MAE du `CatBoostDmqForecaster` par coupure doit
 battre celle du `WeekdayMeanBaseline` sur ≥ 4/5 coupures.
 
+## Validation croisée temporelle
+
+Par défaut, baselines et CatBoost utilisent un split 90/10 temporel. Pour un
+TimeSeriesSplit 3-fold expansif (growing window) :
+
+```bash
+python main.py --step baselines --cv timeseries    # -> data/output/baseline_results_cv.csv
+python main.py --step catboost  --cv timeseries    # -> data/output/catboost_results_cv.csv
+
+# Preset d'hyperparams CatBoost : fast | default | deep
+python main.py --step catboost --catboost-preset fast
+```
+
 ## Résultats
 
 Les résultats sont sauvegardés dans `data/output/` :
-- `baseline_results.csv` : performances comparées des baselines
+- `baseline_results.csv` : performances comparées des baselines (split simple)
+- `baseline_results_cv.csv` : performances baselines en TimeSeriesSplit (`--cv timeseries`)
 - `catboost_results_by_horizon.csv` : performances CatBoost par horizon
+- `catboost_results_cv.csv` : CatBoost en TimeSeriesSplit (`--cv timeseries`)
 - `catboost_model/` : modèle sauvegardé
 - `commandes_predictives.csv` : sortie du moteur de commande déterministe
 - `precision_comparison.csv` : benchmark DMQ par coupure (ML vs baseline)
