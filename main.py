@@ -27,7 +27,9 @@ from src import (
 )
 from src.data_processing import analyze_atm_pattern
 from src.models.baseline import create_baseline_suite, evaluate_all_baselines
-from src.models.catboost_model import CatBoostForecaster, train_and_evaluate_catboost
+from src.models.catboost_model import (
+    CatBoostForecaster, train_and_evaluate_catboost, MultiCoupureForecaster,
+)
 from src.models.evaluation import time_series_cv
 from src.commande import CommandPipeline
 from src.utils import ColumnNames, get_file_path, Messages
@@ -320,6 +322,110 @@ def run_catboost_step(
         return False
 
 
+def run_catboost_dmq_step(preset: str = 'default') -> bool:
+    """Entraînement MultiCoupureForecaster (5 modèles CatBoost, un par coupure).
+
+    Chaque modèle prédit le DMQ d'une coupure spécifique (dmq_5..100) au lieu
+    du montant total. C'est le mode qui doit battre Weekday_Mean.
+    """
+    logger.info("ENTRAÎNEMENT CATBOOST PAR COUPURE (MultiCoupureForecaster)")
+    logger.info("=" * 60)
+
+    try:
+        enriched_file = get_file_path('enriched')
+        if not enriched_file.exists():
+            logger.error("Fichier enrichi non trouvé. Exécutez les étapes précédentes.")
+            return False
+
+        enriched_data = pd.read_csv(
+            enriched_file,
+            parse_dates=[ColumnNames.ORDER_DATE],
+            date_format='%Y-%m-%d',
+        )
+
+        logger.info(f"  Données chargées : {len(enriched_data)} lignes")
+        logger.info(f"  Preset CatBoost : '{preset}'")
+
+        # Vérifier la présence des colonnes cibles
+        from src.utils import COUPURES, DMQ_BY_COUPURE
+        missing = [DMQ_BY_COUPURE[c] for c in COUPURES if DMQ_BY_COUPURE[c] not in enriched_data.columns]
+        if missing:
+            logger.error(f"Colonnes DMQ manquantes : {missing}. Re-lancez --step enrichment.")
+            return False
+
+        # Split temporel 80/20
+        dates = sorted(enriched_data[ColumnNames.ORDER_DATE].unique())
+        split_idx = int(len(dates) * 0.8)
+        split_date = dates[split_idx]
+
+        train_data = enriched_data[enriched_data[ColumnNames.ORDER_DATE] < split_date].copy()
+        test_data = enriched_data[enriched_data[ColumnNames.ORDER_DATE] >= split_date].copy()
+
+        logger.info(f"  Train : {len(train_data)} lignes jusqu'au {split_date.date()}")
+        logger.info(f"  Test  : {len(test_data)} lignes à partir du {split_date.date()}")
+
+        # Entraînement des 5 modèles
+        mcf = MultiCoupureForecaster(
+            max_horizon=14,
+            preset=preset,
+        )
+        mcf.fit(train_data)
+
+        # Évaluation par coupure sur le test set
+        from src.models.evaluation import evaluate_per_coupure
+        import numpy as np
+
+        predictions = {}
+        actuals = {}
+        for c in COUPURES:
+            dmq_col = DMQ_BY_COUPURE[c]
+            y_true_list = []
+            y_pred_list = []
+
+            for atm_id in test_data[ColumnNames.ATM_ID].unique():
+                atm_test = test_data[test_data[ColumnNames.ATM_ID] == atm_id]
+                for _, row in atm_test.iterrows():
+                    pred_date = row[ColumnNames.ORDER_DATE]
+                    try:
+                        pred = mcf.models[c].predict(
+                            atm_id=int(atm_id),
+                            prediction_dates=[pred_date],
+                            context_data=train_data,
+                            horizon=1,
+                        )[0]
+                    except Exception:
+                        continue
+                    y_pred_list.append(float(max(0.0, pred)))
+                    y_true_list.append(float(row[dmq_col]))
+
+            if y_pred_list:
+                predictions[c] = np.array(y_pred_list)
+                actuals[c] = np.array(y_true_list)
+                logger.info(f"  Coupure {c:>3}€ : {len(y_pred_list)} prédictions")
+
+        results_df = evaluate_per_coupure(predictions, actuals)
+
+        output_dir = Path("data/output")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        results_df.to_csv(output_dir / "catboost_dmq_results.csv", index=False)
+
+        logger.info("=" * 60)
+        logger.info("PERFORMANCE PAR COUPURE (CatBoost DMQ) :")
+        for _, row in results_df.iterrows():
+            logger.info(
+                f"  {str(row['coupure']):>5}€ : MAE={row['mae']:.2f}, "
+                f"RMSE={row['rmse']:.2f}, MAPE={row['mape']:.1f}%"
+            )
+
+        return True
+
+    except Exception as e:
+        logger.error(f"ERREUR CATBOOST DMQ : {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
 def run_command_step(
     day_commande: str = None,
     day_livraison: str = None,
@@ -522,7 +628,7 @@ Exemples d'utilisation :
 
     parser.add_argument(
         '--step',
-        choices=['ingestion', 'enrichment', 'analysis', 'baselines', 'catboost', 'command', 'all'],
+        choices=['ingestion', 'enrichment', 'analysis', 'baselines', 'catboost', 'catboost-dmq', 'command', 'all'],
         help="Étape du pipeline à exécuter",
     )
 
@@ -586,6 +692,8 @@ Exemples d'utilisation :
             success = run_baselines_step(cv=args.cv)
         elif args.step == 'catboost':
             success = run_catboost_step(cv=args.cv, preset=args.catboost_preset)
+        elif args.step == 'catboost-dmq':
+            success = run_catboost_dmq_step(preset=args.catboost_preset)
         elif args.step == 'command':
             success = run_command_step(
                 day_commande=args.day_commande,
