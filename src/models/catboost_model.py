@@ -35,16 +35,20 @@ try:
         ColumnNames,
         Messages,
         WEEKDAY_NAMES,
+        DMQ_BY_COUPURE,
         get_file_path,
     )
+    from ..utils.holidays import is_french_holiday, is_eve_of_holiday, is_payday
     from .baseline import BaselineModel
 except ImportError:
     from src.utils import (
         ColumnNames,
         Messages,
         WEEKDAY_NAMES,
+        DMQ_BY_COUPURE,
         get_file_path,
     )
+    from src.utils.holidays import is_french_holiday, is_eve_of_holiday, is_payday
     from src.models.baseline import BaselineModel
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -272,6 +276,26 @@ class CatBoostForecaster(BaselineModel):
                 features[col] = base_row[col]
             else:
                 features[col] = 0
+
+        # === DMQ PAR COUPURE (colonnes enrichies dmq_5..100) ===
+        for coupure, dmq_col in DMQ_BY_COUPURE.items():
+            if dmq_col in base_row.index:
+                features[dmq_col] = base_row[dmq_col]
+            else:
+                features[dmq_col] = 0.0
+
+        # === SIGNAUX DMQ ENRICHIS ===
+        for col in ['dmq_trend_7j', 'dmq_trend_28j', 'dmq_debut_mois_ratio']:
+            if col in base_row.index:
+                features[col] = base_row[col]
+            else:
+                features[col] = 0.0
+
+        # === CALENDRIER FR (date cible) ===
+        target_date_py = target_dt.date()
+        features['target_is_holiday'] = int(is_french_holiday(target_date_py))
+        features['target_is_eve_holiday'] = int(is_eve_of_holiday(target_date_py))
+        features['target_is_payday'] = int(is_payday(target_date_py))
 
         # === FEATURES DE LAG (historique commandes) ===
         if horizon <= self.SHORT_TERM_THRESHOLD and len(historical_data) > 0:
