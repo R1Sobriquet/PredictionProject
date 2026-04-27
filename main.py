@@ -382,26 +382,34 @@ def run_catboost_dmq_step(preset: str = 'default') -> bool:
             y_true_list = []
             y_pred_list = []
 
+            # Coupure sans variance : prédicteur constant
+            is_constant = c in mcf.constant_predictions
+            const_val = mcf.constant_predictions.get(c, 0.0)
+
             for atm_id in test_data[ColumnNames.ATM_ID].unique():
                 atm_test = test_data[test_data[ColumnNames.ATM_ID] == atm_id]
                 for _, row in atm_test.iterrows():
                     pred_date = row[ColumnNames.ORDER_DATE]
-                    try:
-                        pred = mcf.models[c].predict(
-                            atm_id=int(atm_id),
-                            prediction_dates=[pred_date],
-                            context_data=train_data,
-                            horizon=1,
-                        )[0]
-                    except Exception:
-                        continue
+                    if is_constant:
+                        pred = const_val
+                    else:
+                        try:
+                            pred = mcf.models[c].predict(
+                                atm_id=int(atm_id),
+                                prediction_dates=[pred_date],
+                                context_data=train_data,
+                                horizon=1,
+                            )[0]
+                        except Exception:
+                            continue
                     y_pred_list.append(float(max(0.0, pred)))
                     y_true_list.append(float(row[dmq_col]))
 
             if y_pred_list:
                 predictions[c] = np.array(y_pred_list)
                 actuals[c] = np.array(y_true_list)
-                logger.info(f"  Coupure {c:>3}€ : {len(y_pred_list)} prédictions")
+                tag = " (constant)" if is_constant else ""
+                logger.info(f"  Coupure {c:>3}€ : {len(y_pred_list)} prédictions{tag}")
 
         results_df = evaluate_per_coupure(predictions, actuals)
 

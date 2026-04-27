@@ -722,10 +722,33 @@ class MultiCoupureForecaster:
             c: CatBoostDmqForecaster(coupure=c, **kwargs) for c in self.coupures
         }
         self.is_fitted = False
+        # Coupures pour lesquelles le target n'a pas de variance (tout à 0 ou
+        # constante) — on stocke la valeur constante et on skip CatBoost.
+        self.constant_predictions: Dict[int, float] = {}
 
     def fit(self, data: pd.DataFrame, eval_data: Optional[pd.DataFrame] = None) -> 'MultiCoupureForecaster':
         for coupure, model in self.models.items():
             logger.info(f"=== Entraînement modèle coupure {coupure}€ ===")
+
+            # Vérifie la variance de la target avant d'appeler CatBoost
+            target_col = model.target_column
+            if target_col not in data.columns:
+                logger.warning(
+                    f"  Colonne {target_col} absente : prédicteur constant à 0"
+                )
+                self.constant_predictions[coupure] = 0.0
+                continue
+
+            target_values = data[target_col].dropna()
+            if len(target_values) == 0 or target_values.nunique() <= 1:
+                const_val = float(target_values.iloc[0]) if len(target_values) else 0.0
+                logger.warning(
+                    f"  Target {target_col} sans variance (valeur unique = {const_val}) : "
+                    f"prédicteur constant"
+                )
+                self.constant_predictions[coupure] = const_val
+                continue
+
             model.fit(data, eval_data=eval_data)
         self.is_fitted = True
         return self
@@ -743,6 +766,9 @@ class MultiCoupureForecaster:
 
         out: Dict[int, float] = {}
         for coupure, model in self.models.items():
+            if coupure in self.constant_predictions:
+                out[coupure] = float(max(0.0, self.constant_predictions[coupure]))
+                continue
             pred = model.predict(
                 atm_id=atm_id,
                 prediction_dates=[prediction_date],
