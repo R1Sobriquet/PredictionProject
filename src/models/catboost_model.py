@@ -649,6 +649,9 @@ class CatBoostDmqForecaster(CatBoostForecaster):
     """Variante de ``CatBoostForecaster`` qui prédit le **DMQ d'une coupure**
     donnée au lieu du montant total ``amount``.
 
+    Surcharge les stats historiques et les features de lag pour utiliser la
+    colonne cible (``dmq_{coupure}``) au lieu du montant global.
+
     On instancie typiquement 5 modèles (un par coupure) via
     :class:`MultiCoupureForecaster`.
     """
@@ -656,9 +659,242 @@ class CatBoostDmqForecaster(CatBoostForecaster):
     def __init__(self, coupure: int, target_column: Optional[str] = None, **kwargs):
         super().__init__(**kwargs)
         self.coupure = int(coupure)
-        # Par défaut la colonne cible est ``dmq_{coupure}`` (cf. ColumnNames).
         self.target_column = target_column or f"dmq_{self.coupure}"
         self.name = f"CatBoostDMQ_{self.coupure}_H{self.max_horizon}"
+
+    def _compute_historical_stats(self, data: pd.DataFrame) -> None:
+        """Stats historiques basées sur le DMQ de la coupure, pas sur amount."""
+        logger.info("Calcul des statistiques historiques par ATM...")
+
+        tc = self.target_column
+        if tc not in data.columns:
+            super()._compute_historical_stats(data)
+            return
+
+        self.global_stats = {
+            'mean': float(data[tc].mean()),
+            'std': float(data[tc].std()),
+            'median': float(data[tc].median()),
+        }
+
+        for atm_id in data[ColumnNames.ATM_ID].unique():
+            atm_data = data[data[ColumnNames.ATM_ID] == atm_id].sort_values(
+                ColumnNames.ORDER_DATE
+            )
+            vals = atm_data[tc]
+
+            weekday_means = {}
+            if ColumnNames.WEEKDAY in atm_data.columns:
+                weekday_means = (
+                    atm_data.groupby(ColumnNames.WEEKDAY)[tc].mean().to_dict()
+                )
+
+            month_means = {}
+            if ColumnNames.MONTH in atm_data.columns:
+                month_means = (
+                    atm_data.groupby(ColumnNames.MONTH)[tc].mean().to_dict()
+                )
+
+            dates = atm_data[ColumnNames.ORDER_DATE]
+            if len(dates) > 1:
+                avg_frequency = dates.diff().dt.days.dropna().mean()
+            else:
+                avg_frequency = 0
+
+            self.atm_historical_stats[atm_id] = {
+                'mean': float(vals.mean()),
+                'std': float(vals.std()) if len(vals) > 1 else 0.0,
+                'median': float(vals.median()),
+                'max': float(vals.max()),
+                'min': float(vals.min()),
+                'weekday_means': weekday_means,
+                'month_means': month_means,
+                'total_orders': len(atm_data),
+                'avg_frequency': avg_frequency,
+            }
+
+        logger.info(f"  Stats calculées pour {len(self.atm_historical_stats)} ATMs")
+
+    def _build_features(
+        self,
+        base_row: pd.Series,
+        target_date: datetime,
+        horizon: int,
+        atm_stats: Dict,
+        historical_data: pd.DataFrame,
+    ) -> Dict:
+        """Features alignées sur le DMQ de la coupure cible."""
+        features = {}
+        tc = self.target_column
+
+        # === HORIZON ===
+        features['horizon'] = horizon
+        features['horizon_log'] = np.log1p(horizon)
+        features['is_short_term'] = 1 if horizon <= self.SHORT_TERM_THRESHOLD else 0
+
+        # === ATM ===
+        features['atm_id'] = base_row[ColumnNames.ATM_ID]
+        features['atm_mean'] = atm_stats.get('mean', self.global_stats.get('mean', 0))
+        features['atm_std'] = atm_stats.get('std', self.global_stats.get('std', 0))
+        features['atm_median'] = atm_stats.get('median', self.global_stats.get('median', 0))
+        features['atm_avg_frequency'] = atm_stats.get('avg_frequency', 0)
+
+        # === TEMPOREL (date cible) ===
+        target_dt = pd.Timestamp(target_date)
+        features['target_weekday'] = target_dt.weekday()
+        features['target_month'] = target_dt.month
+        features['target_day'] = target_dt.day
+        features['target_quarter'] = target_dt.quarter
+        features['target_is_weekend'] = 1 if target_dt.weekday() >= 5 else 0
+        features['target_is_month_start'] = 1 if target_dt.day <= 5 else 0
+        features['target_is_month_end'] = 1 if target_dt.day > 25 else 0
+        features['target_day_of_year'] = target_dt.dayofyear
+
+        features['target_weekday_sin'] = np.sin(2 * np.pi * target_dt.weekday() / 7)
+        features['target_weekday_cos'] = np.cos(2 * np.pi * target_dt.weekday() / 7)
+        features['target_month_sin'] = np.sin(2 * np.pi * target_dt.month / 12)
+        features['target_month_cos'] = np.cos(2 * np.pi * target_dt.month / 12)
+        features['target_day_of_year_sin'] = np.sin(2 * np.pi * target_dt.dayofyear / 365.25)
+        features['target_day_of_year_cos'] = np.cos(2 * np.pi * target_dt.dayofyear / 365.25)
+
+        # Moyennes historiques par jour/mois (basées sur le DMQ de la coupure)
+        weekday_means = atm_stats.get('weekday_means', {})
+        features['atm_weekday_mean'] = weekday_means.get(
+            target_dt.weekday(), atm_stats.get('mean', 0)
+        )
+        month_means = atm_stats.get('month_means', {})
+        features['atm_month_mean'] = month_means.get(
+            target_dt.month, atm_stats.get('mean', 0)
+        )
+
+        # === FEATURES ATM (de la ligne de base) ===
+        for col in ['volatilite_dmq', 'evenement_en_cours', 'risque_atm_vide',
+                     'total_soldes', 'total_ajustement', 'total_k7hs', 'cassettes_actives']:
+            if col in base_row.index:
+                features[col] = base_row[col]
+            else:
+                features[col] = 0
+
+        # === DMQ PAR COUPURE (colonnes enrichies dmq_5..100) ===
+        for coupure, dmq_col in DMQ_BY_COUPURE.items():
+            if dmq_col in base_row.index:
+                features[dmq_col] = base_row[dmq_col]
+            else:
+                features[dmq_col] = 0.0
+
+        # === SIGNAUX DMQ ENRICHIS ===
+        for col in ['dmq_trend_7j', 'dmq_trend_28j', 'dmq_debut_mois_ratio']:
+            if col in base_row.index:
+                features[col] = base_row[col]
+            else:
+                features[col] = 0.0
+
+        # === CALENDRIER FR (date cible) ===
+        target_date_py = target_dt.date()
+        features['target_is_holiday'] = int(is_french_holiday(target_date_py))
+        features['target_is_eve_holiday'] = int(is_eve_of_holiday(target_date_py))
+        features['target_is_payday'] = int(is_payday(target_date_py))
+
+        # === FEATURES DE LAG (basées sur le DMQ de la coupure, pas amount) ===
+        tc_available = tc in base_row.index
+        if horizon <= self.SHORT_TERM_THRESHOLD and len(historical_data) > 0 and tc_available:
+            features['last_dmq'] = float(base_row[tc])
+
+            if len(historical_data) >= 2 and tc in historical_data.columns:
+                features['prev_dmq'] = float(historical_data.iloc[-2][tc])
+            else:
+                features['prev_dmq'] = atm_stats.get('mean', 0)
+
+            if tc in historical_data.columns:
+                tail5 = historical_data.tail(5)[tc]
+                tail10 = historical_data.tail(10)[tc]
+            else:
+                tail5 = pd.Series([atm_stats.get('mean', 0)])
+                tail10 = tail5
+
+            features['rolling_mean_5'] = float(tail5.mean())
+            features['rolling_mean_10'] = float(tail10.mean())
+            features['rolling_std_5'] = float(tail5.std()) if len(tail5) > 1 else 0.0
+            features['recent_trend'] = features['rolling_mean_5'] - features['rolling_mean_10']
+
+            if ColumnNames.DAYS_SINCE_LAST_ORDER in base_row.index:
+                features['days_since_last'] = base_row[ColumnNames.DAYS_SINCE_LAST_ORDER]
+            else:
+                features['days_since_last'] = 0
+        else:
+            mean_val = atm_stats.get('mean', 0)
+            features['last_dmq'] = mean_val
+            features['prev_dmq'] = mean_val
+            features['rolling_mean_5'] = mean_val
+            features['rolling_mean_10'] = mean_val
+            features['rolling_std_5'] = atm_stats.get('std', 0)
+            features['recent_trend'] = 0
+            features['days_since_last'] = atm_stats.get('avg_frequency', 0)
+
+        return features
+
+    def _build_default_features(self, atm_id, target_date, horizon, atm_stats):
+        """Features par défaut quand il n'y a pas d'historique (DMQ version)."""
+        features = {}
+        features['horizon'] = horizon
+        features['horizon_log'] = np.log1p(horizon)
+        features['is_short_term'] = 1 if horizon <= self.SHORT_TERM_THRESHOLD else 0
+
+        features['atm_id'] = atm_id
+        features['atm_mean'] = atm_stats.get('mean', self.global_stats.get('mean', 0))
+        features['atm_std'] = atm_stats.get('std', self.global_stats.get('std', 0))
+        features['atm_median'] = atm_stats.get('median', self.global_stats.get('median', 0))
+        features['atm_avg_frequency'] = atm_stats.get('avg_frequency', 0)
+
+        target_dt = pd.Timestamp(target_date)
+        features['target_weekday'] = target_dt.weekday()
+        features['target_month'] = target_dt.month
+        features['target_day'] = target_dt.day
+        features['target_quarter'] = target_dt.quarter
+        features['target_is_weekend'] = 1 if target_dt.weekday() >= 5 else 0
+        features['target_is_month_start'] = 1 if target_dt.day <= 5 else 0
+        features['target_is_month_end'] = 1 if target_dt.day > 25 else 0
+        features['target_day_of_year'] = target_dt.dayofyear
+
+        features['target_weekday_sin'] = np.sin(2 * np.pi * target_dt.weekday() / 7)
+        features['target_weekday_cos'] = np.cos(2 * np.pi * target_dt.weekday() / 7)
+        features['target_month_sin'] = np.sin(2 * np.pi * target_dt.month / 12)
+        features['target_month_cos'] = np.cos(2 * np.pi * target_dt.month / 12)
+        features['target_day_of_year_sin'] = np.sin(2 * np.pi * target_dt.dayofyear / 365.25)
+        features['target_day_of_year_cos'] = np.cos(2 * np.pi * target_dt.dayofyear / 365.25)
+
+        weekday_means = atm_stats.get('weekday_means', {})
+        features['atm_weekday_mean'] = weekday_means.get(
+            target_dt.weekday(), atm_stats.get('mean', 0)
+        )
+        month_means = atm_stats.get('month_means', {})
+        features['atm_month_mean'] = month_means.get(
+            target_dt.month, atm_stats.get('mean', 0)
+        )
+
+        for col in ['volatilite_dmq', 'evenement_en_cours', 'risque_atm_vide',
+                     'total_soldes', 'total_ajustement', 'total_k7hs', 'cassettes_actives']:
+            features[col] = 0
+
+        for dmq_col in DMQ_BY_COUPURE.values():
+            features[dmq_col] = 0.0
+        for col in ['dmq_trend_7j', 'dmq_trend_28j', 'dmq_debut_mois_ratio']:
+            features[col] = 0.0
+
+        features['target_is_holiday'] = 0
+        features['target_is_eve_holiday'] = 0
+        features['target_is_payday'] = 0
+
+        mean_val = atm_stats.get('mean', 0)
+        features['last_dmq'] = mean_val
+        features['prev_dmq'] = mean_val
+        features['rolling_mean_5'] = mean_val
+        features['rolling_mean_10'] = mean_val
+        features['rolling_std_5'] = atm_stats.get('std', 0)
+        features['recent_trend'] = 0
+        features['days_since_last'] = atm_stats.get('avg_frequency', 0)
+
+        return features
 
     def _prepare_features_for_training(self, data: pd.DataFrame) -> pd.DataFrame:
         """Même logique que la classe parente mais en lisant la target
@@ -697,7 +933,6 @@ class CatBoostDmqForecaster(CatBoostForecaster):
                         atm_stats=atm_stats,
                         historical_data=atm_data.iloc[:idx + 1],
                     )
-                    # Target = DMQ de la coupure (ex: dmq_5)
                     features['target'] = float(target_row[self.target_column])
                     all_examples.append(features)
 
