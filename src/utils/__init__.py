@@ -1,5 +1,5 @@
 """
-Module utilitaires du projet de prévision de commandes.
+Module utilitaires du projet de prévision de commandes ATM.
 Contient la configuration et les fonctions communes.
 """
 
@@ -8,11 +8,33 @@ from .config import (
     ValidationRules,
     DisplayConfig,
     Messages,
+    DataSourceConfig,
+    CommandConfig,
     WEEKDAY_NAMES,
     WEEKEND_DAYS,
+    COLUMNS_TO_LOAD,
+    COLUMN_MAPPING,
+    CASSETTE_COLUMNS,
+    AJUSTEMENT_COLUMNS,
+    SOLDES_COLUMNS,
+    K7HS_COLUMNS,
+    COUPURES,
+    SOLDES_BY_COUPURE,
+    K7HS_BY_COUPURE,
+    DMQ_BY_COUPURE,
+    PREDICTIF_BY_COUPURE,
+    NB_CASSETTES_BY_COUPURE,
+    PREDICTIF_COLUMNS,
+    DMQ_COLUMNS,
+    NB_CASSETTES_COLUMNS,
     get_training_date_range,
     get_file_path,
-    DataSourceConfig
+)
+from .holidays import (
+    is_french_holiday,
+    is_eve_of_holiday,
+    is_payday,
+    french_holidays,
 )
 
 __all__ = [
@@ -20,9 +42,29 @@ __all__ = [
     'ValidationRules',
     'DisplayConfig',
     'Messages',
+    'DataSourceConfig',
+    'CommandConfig',
     'WEEKDAY_NAMES',
     'WEEKEND_DAYS',
+    'COLUMNS_TO_LOAD',
+    'COLUMN_MAPPING',
+    'CASSETTE_COLUMNS',
+    'AJUSTEMENT_COLUMNS',
+    'SOLDES_COLUMNS',
+    'K7HS_COLUMNS',
+    'COUPURES',
+    'SOLDES_BY_COUPURE',
+    'K7HS_BY_COUPURE',
+    'DMQ_BY_COUPURE',
+    'PREDICTIF_BY_COUPURE',
+    'NB_CASSETTES_BY_COUPURE',
+    'PREDICTIF_COLUMNS',
+    'DMQ_COLUMNS',
+    'NB_CASSETTES_COLUMNS',
     'get_training_date_range',
     'get_file_path',
-    'DataSourceConfig'
+    'is_french_holiday',
+    'is_eve_of_holiday',
+    'is_payday',
+    'french_holidays',
 ]

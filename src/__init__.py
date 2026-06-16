@@ -1,55 +1,50 @@
 """
-Module principal du projet de prévision de commandes.
+Module principal du projet de prévision de commandes ATM.
 
 Architecture :
-- data_ingestion : Chargement et nettoyage des données
-- data_processing : Enrichissement des données
+- data_ingestion : Chargement et nettoyage des données (.xlsx ou BDD)
+- data_processing : Enrichissement avec features ATM
 - visualization : Graphiques et analyses
-- models/ : Modèles de prévision (baseline et avancés)
+- models/ : Modèles de prévision (baseline et CatBoost)
 - utils/ : Configuration et utilitaires
 """
 
 try:
-    # Import relatif (quand utilisé comme package)
-    from .data_ingestion import DataIngestionPipeline, quick_data_ingestion, preview_raw_data
-    from .data_processing import DataEnrichmentPipeline, quick_enrichment, analyze_article_pattern
-    from .visualization import DataVisualization, create_article_dashboard, create_global_analysis
+    from .data_ingestion import DataIngestionPipeline, quick_data_ingestion
+    from .data_processing import DataEnrichmentPipeline, quick_enrichment, analyze_atm_pattern
+    from .visualization import DataVisualization, create_atm_dashboard, create_global_analysis
+    from .database_connector import DatabaseConnector
     from .models import (
         BaselineModel, NaiveBaseline, HistoricalMeanBaseline,
         MovingAverageBaseline, WeekdayMeanBaseline, SeasonalNaiveBaseline,
-        TrendBaseline, BaselineEnsemble
+        TrendBaseline, BaselineEnsemble,
     )
+    from .commande import CommandPipeline, CommandDecision, AtmConfig
 except ImportError:
-    # Import absolu (quand exécuté directement)
-    from src.data_ingestion import DataIngestionPipeline, quick_data_ingestion, preview_raw_data
-    from src.data_processing import DataEnrichmentPipeline, quick_enrichment, analyze_article_pattern
-    from src.visualization import DataVisualization, create_article_dashboard, create_global_analysis
+    from src.data_ingestion import DataIngestionPipeline, quick_data_ingestion
+    from src.data_processing import DataEnrichmentPipeline, quick_enrichment, analyze_atm_pattern
+    from src.visualization import DataVisualization, create_atm_dashboard, create_global_analysis
+    from src.database_connector import DatabaseConnector
     from src.models.baseline import (
         BaselineModel, NaiveBaseline, HistoricalMeanBaseline,
         MovingAverageBaseline, WeekdayMeanBaseline, SeasonalNaiveBaseline,
-        TrendBaseline, BaselineEnsemble
+        TrendBaseline, BaselineEnsemble,
     )
+    from src.commande import CommandPipeline, CommandDecision, AtmConfig
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 __author__ = "Forecasting Team"
 
 __all__ = [
-    # Pipeline principal
     'DataIngestionPipeline',
     'DataEnrichmentPipeline',
     'DataVisualization',
-
-    # Fonctions rapides
+    'DatabaseConnector',
     'quick_data_ingestion',
     'quick_enrichment',
-    'preview_raw_data',
-
-    # Analyse et visualisation
-    'analyze_article_pattern',
-    'create_article_dashboard',
+    'analyze_atm_pattern',
+    'create_atm_dashboard',
     'create_global_analysis',
-
-    # Modèles de baseline
     'BaselineModel',
     'NaiveBaseline',
     'HistoricalMeanBaseline',
@@ -57,7 +52,8 @@ __all__ = [
     'WeekdayMeanBaseline',
     'SeasonalNaiveBaseline',
     'TrendBaseline',
-    'BaselineEnsemble'
+    'BaselineEnsemble',
+    'CommandPipeline',
+    'CommandDecision',
+    'AtmConfig',
 ]
-
-

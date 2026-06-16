@@ -127,6 +127,105 @@ data/output/
 
 ---
 
+## 🏦 5. Moteur de commande déterministe (module 4.1 PredikATM)
+
+### 🎯 Règle métier clé
+
+> **Si une des 5 valeurs par coupure (5 / 10 / 20 / 50 / 100 €) est > 0,
+> alors c'est une commande.**
+
+Autrement dit : `is_command = any(predictif_c > 0)`. Le moteur produit **5
+valeurs par coupure** au lieu d'un simple montant agrégé, conformément à la
+doc PredikATM.
+
+### 🧩 Les 6 étapes (`src/commande/`)
+
+| # | Module | Rôle | Règle clé |
+|---|--------|------|-----------|
+| **0** | `k7hs_detector.py` | Détection cassettes hors service | Solde inchangé ≥ 3 jours sur les 15 derniers → HS |
+| **1** | `solde_simulator.py` | Projection au jour du chargement | `solde − 2,5 × DMQ` (hors férié) + commandes non chargées |
+| **2** | `command_calculator.py` | Calcul nb billets par coupure | `max(0, SEUIL_MAX × nb_cassettes − solde)` |
+| **3** | `verifications.py` | Vérifications min + Axytrans | Si total < 2 000 € → supprimée. Si Axytrans : cap 75 000 € / 2 600 billets × conteneur |
+| **4** | `exceptional.py` | Commande exceptionnelle | Soir à `3,0 × DMQ` : si solde < DMQ → demi-seuil max |
+| **5** | `pipeline.py` | Sélection finale | Exceptionnelle / clic-clac (seuil max) / complément (étape 2) |
+| **6** | `insurance.py` | Caps assurance | Cap agence + cap global 300 000 € → revérifier min |
+
+### 📤 Sortie du moteur
+
+Fichier `data/output/commandes_predictives.csv`, une ligne par automate :
+
+| Colonne | Description |
+|---------|-------------|
+| `predictif_5..100` | Nombre de billets à commander par coupure |
+| `k7hs_5..100` | True si cassette HS (→ 0 billets commandés) |
+| `is_command` | **any(predictif_c > 0)** — règle métier clé |
+| `is_command_exceptionnelle` | True si étape 4 déclenchée |
+| `alerte_risque_vide` | Solde soir < DMQ sur ≥ 1 coupure |
+| `alerte_commande_supprimee` | Commande annulée (< seuil min) |
+| `montant_total` | `Σ predictif_c × c` (€) |
+
+### 🚀 Commande CLI
+
+```bash
+python main.py --step command \
+    --day-commande 2026-03-30 \
+    --day-livraison 2026-04-02
+```
+
+---
+
+## 📈 6. Amélioration de la précision (prédiction DMQ par coupure)
+
+### Avant / après (hyperparamètres CatBoost)
+
+| Paramètre | Avant | Après | Gain attendu |
+|-----------|-------|-------|--------------|
+| `learning_rate` | **0.85** | **0.03** | Convergence stable (vs overfitting brutal) |
+| `iterations` | 4444 | 4000 + early stop | Plus robuste |
+| `l2_leaf_reg` | ∅ | **3.0** | Régularisation explicite |
+| `subsample` / `rsm` | ∅ | **0.85 / 0.85** | Bagging Bernoulli |
+| `loss_function` | `RMSE` | **`MAE`** | Robuste aux outliers |
+| Target | Montant total | **5 × `dmq_{coupure}`** | Exploite la structure par coupure |
+
+### Nouveau pipeline ML : `MultiCoupureForecaster`
+
+Un modèle `CatBoostDmqForecaster` **par coupure** (5 modèles indépendants).
+Exposé au moteur de commande via `as_dmq_provider()`.
+
+### Validation temporelle
+
+- `time_series_cv()` → 3-fold **growing window** (pas de fuite futur → passé)
+- `evaluate_per_coupure()` → MAE / RMSE / MAPE par coupure + TOTAL
+- Comparaison systématique vs `WeekdayMeanBaseline` (baseline recommandée)
+
+### Features DMQ ajoutées (`add_dmq_features()`)
+
+- `dmq_volatilite` (écart-type 28 j) — exploite `DC_VolatiliteDmq`
+- `dmq_trend_7j` / `dmq_trend_28j` — pente linéaire régressée
+- `dmq_debut_mois_ratio` — ratio DMQ du jour / DMQ moyen
+- `soldes_ratio_assurance` — indicateur de remplissage
+
+### 🎯 Critère de succès
+
+> La MAE du `CatBoostDmqForecaster` par coupure doit battre celle du
+> `WeekdayMeanBaseline` sur **≥ 4/5 coupures**.
+
+Benchmark : `python tests/benchmark_dmq.py` → `data/output/precision_comparison.csv`.
+
+---
+
+## ✅ 7. Tests
+
+- **`tests/test_commande.py`** — 28 tests unitaires (un par étape + 3 tests bout-en-bout)
+- **`tests/benchmark_dmq.py`** — benchmark précision ML vs baseline
+
+```bash
+python -m pytest tests/test_commande.py -v   # 28 tests
+python tests/benchmark_dmq.py                # Benchmark
+```
+
+---
+
 ## 🚀 Démonstration rapide
 
 ```bash
@@ -136,8 +235,12 @@ nano .env   # DATA_SOURCE=sqlserver ou csv
 # 2. Lancer le pipeline complet
 python main.py --step all
 
-# 3. Visualiser les résultats
+# 3. Générer les commandes prédictives par coupure
+python main.py --step command --day-commande 2026-03-30 --day-livraison 2026-04-02
+
+# 4. Visualiser les résultats
 cat data/output/baseline_results.csv
+cat data/output/commandes_predictives.csv
 ```
 
 Durée d'exécution : **1 à 3 minutes** selon la taille des données.

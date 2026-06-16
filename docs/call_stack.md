@@ -13,6 +13,8 @@ Document technique détaillant chaque appel de fonction du pipeline, référenc�
 | **Visualisation** | 13-14 | `src/visualization.py` | `plot_*()` |
 | **Modélisation** | 15-18 | `src/models/baseline.py` | `evaluate_all_baselines()` |
 | **Prédiction** | 19-20 | `src/models/baseline.py` | `predict()` |
+| **ML par coupure** | 21-23 | `src/models/catboost_model.py` | `MultiCoupureForecaster.fit/predict_dmq_par_coupure()` |
+| **Moteur de commande** | 30-36 | `src/commande/pipeline.py` | `CommandPipeline.run()` — 6 étapes |
 
 ---
 
@@ -921,4 +923,325 @@ diff data/snapshots/snapshot_04_cleaned.csv data/snapshots/snapshot_05_aggregate
 
 ---
 
-*Document maintenu à jour avec le code - Version 1.0.0*
+## 🤖 PHASE ML PAR COUPURE — ÉTAPES 21-23 (nouveau)
+
+### Appels de Fonction
+
+**Fichier :** `src/models/catboost_model.py`
+
+```python
+class MultiCoupureForecaster:
+    def fit(self, data, eval_data=None):
+        """Entraîne 1 CatBoostDmqForecaster par coupure (5 / 10 / 20 / 50 / 100)."""
+
+    def predict_dmq_par_coupure(self, atm_id, prediction_date, context_data=None, horizon=None):
+        """→ Dict[coupure, float] : DMQ prédit par coupure pour un ATM."""
+
+    def as_dmq_provider(self, prediction_date, context_data=None, horizon=None):
+        """Adaptateur vers l'interface DmqProvider du CommandPipeline."""
+```
+
+### Pile d'Appels Détaillée
+
+**Niveau 1 :** `catboost_model.py`
+```python
+def fit(self, data, eval_data=None):
+    """Itère sur self.models = {5, 10, 20, 50, 100}"""
+    for coupure, model in self.models.items():
+        model.fit(data, eval_data=eval_data)  # CatBoostDmqForecaster.fit
+```
+
+**Niveau 2 :** `catboost_model.py::CatBoostDmqForecaster._prepare_features_for_training`
+```python
+# target = 'dmq_{coupure}' au lieu de 'amount'
+features['target'] = float(target_row[self.target_column])
+```
+
+**Niveau 3 :** `catboost_model.py::CatBoostForecaster._build_features`
+```python
+# Réutilise toutes les features ATM + DMQ historiques
+# cat_features = ['atm_id', 'weekday_name', ...]
+```
+
+### Fichier créé
+
+- Modèle sauvegardé via `model.save_model(output_dir / 'catboost_dmq_{coupure}')`
+
+### Évaluation
+
+**Fichier :** `src/models/evaluation.py`
+
+```python
+def evaluate_per_coupure(predictions: Dict[int, np.ndarray], actuals: Dict[int, np.ndarray]) -> pd.DataFrame:
+    """MAE / RMSE / MAPE par coupure + ligne TOTAL."""
+
+def time_series_cv(model_factory, data, n_splits=3, target_column='amount') -> pd.DataFrame:
+    """3-fold growing window (pas de fuite futur → passé)."""
+
+def compare_models_per_coupure(models_per_coupure, actuals) -> pd.DataFrame:
+    """Comparaison multi-modèles sur le même split → [model, coupure, mae, rmse, mape]."""
+```
+
+**Benchmark :** `python tests/benchmark_dmq.py` → `data/output/precision_comparison.csv`.
+
+---
+
+## 🏦 PHASE MOTEUR DE COMMANDE — ÉTAPES 30-36 (nouveau)
+
+### Point d'Entrée
+
+**Fichier :** `main.py`
+
+```python
+def run_command_step(day_commande=None, day_livraison=None):
+    """Orchestre le moteur de commande déterministe (6 étapes)."""
+    # 1. Charger enriched_data
+    # 2. Prendre le dernier snapshot par ATM (groupby + tail(1))
+    # 3. CommandPipeline().run(current_data, historical_data, day_commande, day_livraison)
+    # 4. Sauvegarder data/output/commandes_predictives.csv
+```
+
+**CLI :**
+```bash
+python main.py --step command --day-commande 2026-03-30 --day-livraison 2026-04-02
+```
+
+---
+
+### ÉTAPE 30 : Détection K7 HS (étape 0 de la doc)
+
+**Fichier :** `src/commande/k7hs_detector.py`
+
+```python
+def detect_k7hs(
+    historical_soldes: pd.DataFrame,
+    window_days: int = 15,
+    stale_threshold: int = 3,
+) -> Dict[int, bool]:
+    """
+    Règle :
+        Sur les N derniers soldes, si la cassette n'a pas bougé
+        depuis les `stale_threshold` derniers jours → HS.
+
+    Args:
+        historical_soldes: Historique (trié ASC) des soldes d'un ATM.
+        window_days: Nombre de derniers soldes à observer (15).
+        stale_threshold: Jours consécutifs sans variation (3).
+
+    Returns:
+        {5: True/False, 10: ..., 20: ..., 50: ..., 100: ...}
+    """
+```
+
+**Détails implémentation :**
+- `diffs = np.diff(series)` vectorisé
+- `no_move = np.isclose(diffs, 0.0, atol=1e-6)` (tolérance flottante)
+- `result[coupure] = bool(no_move[-stale:].all())`
+
+---
+
+### ÉTAPE 31 : Simulation solde au chargement (étape 1 de la doc)
+
+**Fichier :** `src/commande/solde_simulator.py`
+
+```python
+def simulate_solde_at_loading(
+    solde_jour: Dict[int, float],
+    dmq_par_coupure: Dict[int, float],
+    day_commande: date,
+    day_chargement: date,
+    pending_commands: List[PendingCommand] = None,
+    is_holiday: IsHolidayFn = DEFAULT_IS_HOLIDAY,
+    conso_factor: float = 2.5,
+) -> Dict[int, float]:
+    """
+    Projette les soldes jusqu'au jour de chargement :
+        - soustrait 2,5 × DMQ par coupure (hors férié)
+        - ajoute les commandes non encore chargées rencontrées
+    """
+```
+
+**Callback injectable :**
+```python
+IsHolidayFn = Callable[[date], bool]
+DEFAULT_IS_HOLIDAY = lambda d: False  # stub
+```
+
+---
+
+### ÉTAPE 32 : Calcul par coupure (étape 2 de la doc)
+
+**Fichier :** `src/commande/command_calculator.py`
+
+```python
+def compute_command_per_coupure(
+    solde_chargement: Dict[int, float],
+    nb_cassettes_par_coupure: Dict[int, int],
+    k7hs: Dict[int, bool],
+) -> CommandeParCoupure:
+    """
+    Formule :
+        nb_billets[c] = max(0, SEUIL_MAX[c] × nb_cassettes[c] − solde[c])
+        (0 si k7hs[c] == True)
+    """
+```
+
+**Variantes :**
+- `compute_command_clic_clac()` — remplit au seuil max (mode remplacement)
+- `compute_command_exceptionnelle()` — demi-seuil max par coupure
+
+---
+
+### ÉTAPE 33 : Vérifications (étape 3 de la doc)
+
+**Fichier :** `src/commande/verifications.py`
+
+```python
+def check_min_command(commande) -> (CommandeParCoupure, VerificationFlags):
+    """Si montant < 2 000 € → commande supprimée (0 partout)."""
+
+def reduce_for_axytrans(commande, mode_livraison, nb_conteneurs):
+    """
+    Si mode == 'axytrans' :
+        1) Cap montant : 75 000 €
+        2) Cap billets : 2 600 × nb_conteneurs
+    Stratégie : retirer les plus petites coupures d'abord (minimise
+    la perte de valeur).
+    """
+```
+
+---
+
+### ÉTAPE 34 : Commande exceptionnelle (étape 4 de la doc)
+
+**Fichier :** `src/commande/exceptional.py`
+
+```python
+def evaluate_exceptional(
+    solde_soir: Dict[int, float],
+    dmq_par_coupure: Dict[int, float],
+    day_livraison: date,
+    atm_id: int,
+    k7hs: Dict[int, bool] = None,
+    tournee_available: TourneeAvailableFn = DEFAULT_TOURNEE_AVAILABLE,
+) -> ExceptionalDecision:
+    """
+    risque_vide = True si ∃ c tel que solde_soir[c] < DMQ[c] (et c non-HS)
+    autorisee   = risque_vide AND tournee_available(day_livraison, atm_id)
+    """
+```
+
+**Callback injectable :**
+```python
+TourneeAvailableFn = Callable[[date, int], bool]
+DEFAULT_TOURNEE_AVAILABLE = lambda d, atm: True  # stub
+```
+
+---
+
+### ÉTAPE 35 : Sélection finale (étape 5 de la doc)
+
+**Fichier :** `src/commande/pipeline.py` (logique dans `_process_single`)
+
+```python
+if exceptional.risque_vide and exceptional.autorisee:
+    commande = compute_command_exceptionnelle(...)          # demi-seuil
+    decision.is_command_exceptionnelle = True
+elif mode_chargement.lower() == 'clic-clac':
+    commande = compute_command_clic_clac(...)               # seuil max
+else:
+    # conserve le résultat de l'étape 2 (complément)
+    pass
+```
+
+---
+
+### ÉTAPE 36 : Assurance agence + cap global (étape 6 de la doc)
+
+**Fichier :** `src/commande/insurance.py`
+
+```python
+def apply_insurance_caps(
+    commande,
+    commandes_en_cours_agence_eur: float,
+    insurance_amount_eur: float,
+    global_cap_eur: float = 300_000,
+    min_amount: float = 2_000,
+) -> (CommandeParCoupure, InsuranceFlags):
+    """
+    1) Cap assurance agence : si (en_cours + commande) > assurance → réduire.
+    2) Cap global 300 000 € : idem.
+    3) Si après réduction < min_amount → commande supprimée.
+    """
+```
+
+**Note :** le `CommandPipeline` accumule les montants par `agency_key` pour
+alimenter `commandes_en_cours_agence_eur` à chaque ATM suivant.
+
+---
+
+### SNAPSHOT FINAL : `data/output/commandes_predictives.csv`
+
+**Colonnes créées :**
+
+| Colonne | Type | Description |
+|---------|------|-------------|
+| `atm_id` | int | Identifiant automate |
+| `predictif_5..100` | int | Nombre de billets à commander par coupure |
+| `k7hs_5..100` | bool | True si cassette hors service |
+| `is_command` | bool | **`any(predictif_c > 0)`** — règle métier |
+| `is_command_exceptionnelle` | bool | Étape 4 déclenchée |
+| `alerte_risque_vide` | bool | ≥ 1 coupure < DMQ au soir |
+| `alerte_commande_supprimee` | bool | Commande < seuil min |
+| `alerte_commande_precedente_non_chargee` | bool | PendingCommand fournie |
+| `montant_total` | int | Σ predictif_c × c (€) |
+
+---
+
+### Diagramme d'orchestration (CommandPipeline.run)
+
+```
+current_data (N ATMs)
+      │
+      ├─ groupby(atm_id) ─→ history_by_atm
+      │
+      ├─ dmq_provider (ml ou historical)
+      │
+      └─ for each ATM row:
+           │
+           ├─ ÉTAPE 30 : detect_k7hs(history)
+           │
+           ├─ ÉTAPE 31 : simulate_solde_at_loading(solde_jour, dmq, ...)
+           │                       ↓
+           ├─ ÉTAPE 32 : compute_command_per_coupure(solde_chargement, cassettes, k7hs)
+           │                       ↓
+           ├─ ÉTAPE 33 : check_min_command → reduce_for_axytrans
+           │                       ↓
+           ├─ ÉTAPE 34 : simulate_solde_evening → evaluate_exceptional
+           │                       ↓
+           ├─ ÉTAPE 35 : if risque+autorisee → exceptionnelle
+           │             elif clic-clac     → clic-clac
+           │                       ↓
+           ├─ ÉTAPE 36 : apply_insurance_caps(agency_cap, global_cap)
+           │                       ↓
+           └─ decision.to_row() + accumulate agency total
+      │
+      ↓
+DataFrame output (N × 13 colonnes)
+```
+
+---
+
+## 📋 Mise à jour des fichiers créés
+
+| Étape | Fichier | Description |
+|-------|---------|-------------|
+| **Précision ML** | | |
+| 21-23 | `data/output/catboost_dmq_{5,10,20,50,100}/` | 5 modèles CatBoost par coupure |
+| 21-23 | `data/output/precision_comparison.csv` | Benchmark MAE par coupure (ML vs baseline) |
+| **Moteur de commande** | | |
+| 30-36 | `data/output/commandes_predictives.csv` | 5 predictif_* + is_command + alertes par ATM |
+
+---
+
+*Document maintenu à jour avec le code - Version 1.1.0 (ajout moteur de commande)*

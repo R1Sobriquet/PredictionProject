@@ -1,5 +1,5 @@
 """
-Module de modélisation pour la prévision de commandes.
+Module de modélisation pour la prévision de commandes ATM.
 
 Contient :
 - Modèles de baseline (référence)
@@ -16,16 +16,17 @@ from .baseline import (
     TrendBaseline,
     BaselineEnsemble,
     create_baseline_suite,
-    evaluate_all_baselines
+    evaluate_all_baselines,
 )
 
 from .catboost_model import (
     CatBoostForecaster,
-    train_and_evaluate_catboost
+    CatBoostDmqForecaster,
+    MultiCoupureForecaster,
+    train_and_evaluate_catboost,
 )
 
 __all__ = [
-    # Baselines
     'BaselineModel',
     'NaiveBaseline',
     'HistoricalMeanBaseline',
@@ -36,8 +37,8 @@ __all__ = [
     'BaselineEnsemble',
     'create_baseline_suite',
     'evaluate_all_baselines',
-
-    # CatBoost
     'CatBoostForecaster',
-    'train_and_evaluate_catboost'
+    'CatBoostDmqForecaster',
+    'MultiCoupureForecaster',
+    'train_and_evaluate_catboost',
 ]

@@ -8,9 +8,9 @@ Ce script :
 4. Sauvegarde dans un fichier CSV exploitable
 
 Usage:
-    python generate_predictions.py --month 2024-12  # Décembre 2024
-    python generate_predictions.py --month 2025-01  # Janvier 2025
-    python generate_predictions.py --year 2025      # Toute l'année 2025
+    python scripts/generate_predictions.py --month 2024-12  # Décembre 2024
+    python scripts/generate_predictions.py --month 2025-01  # Janvier 2025
+    python scripts/generate_predictions.py --year 2025      # Toute l'année 2025
 """
 
 import pandas as pd
@@ -20,8 +20,8 @@ from pathlib import Path
 import argparse
 import sys
 
-# Ajouter le répertoire racine au path
-project_root = Path(__file__).parent
+# Ajouter le répertoire racine au path (scripts/ -> racine projet)
+project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from src.models.baseline import (

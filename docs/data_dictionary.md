@@ -131,5 +131,79 @@ date,article_id,quantity,article_ref,year,month,day,weekday,weekday_name,is_week
 
 ---
 
-**Date de dernière mise à jour :** 2025-10-15
-**Version du pipeline :** 1.0.0  
+**Date de dernière mise à jour :** 2026-04-16  
+**Version du pipeline :** 1.1.0 (ajout moteur de commande + DMQ par coupure)
+
+---
+
+## 🏦 **COLONNES PAR COUPURE** (Moteur de commande — v1.1.0)
+
+Ces colonnes correspondent aux billets **5 / 10 / 20 / 50 / 100 €** de la
+documentation PredikATM. Elles alimentent le moteur de commande
+(`src/commande/`) et sont produites par `CatBoostDmqForecaster` +
+`CommandPipeline`.
+
+### 🔸 **Soldes par coupure** (source — table HFSQL)
+
+| Nom dans le CSV | Description | Comment elle est obtenue |
+|-----------------|-------------|--------------------------|
+| `soldes_5` / `_10` / `_20` / `_50` / `_100` | Nombre de billets présents par coupure | **Source :** `DC_SoldesDuJour_{c}` depuis HFSQL<br>**Type :** float<br>**Usage :** alimente la détection K7 HS et la simulation de solde |
+| `k7hs_5` / `_10` / `_20` / `_50` / `_100` | Flag cassette hors service | **Source :** `DC_K7HS_{c}` depuis HFSQL (valeur brute)<br>**Recalculé** par `detect_k7hs()` sur historique (15 j / 3 j stale)<br>**Type :** bool |
+| `ajustement_5..100` | Ajustements par coupure | **Source :** `DC_Ajustement_{c}` depuis HFSQL<br>**Usage :** traçabilité des corrections manuelles |
+
+### 🔸 **DMQ par coupure** (calculées par enrichissement — v1.1.0)
+
+Consommation Quotidienne Moyenne projetée pour chaque coupure.
+
+| Nom dans le CSV | Description | Comment elle est obtenue |
+|-----------------|-------------|--------------------------|
+| `dmq_5` / `_10` / `_20` / `_50` / `_100` | DMQ prédit par coupure (billets/jour) | **Calcul :** moyenne glissante 28 j des baisses de solde par coupure<br>**Alternative :** prédiction ML via `CatBoostDmqForecaster.predict()`<br>**Source config :** `DMQ_SOURCE=ml\|historical` (.env)<br>**Usage :** entrée du `CommandPipeline` (étapes 1 & 4) |
+| `dmq_volatilite` | Écart-type glissant 28 j du DMQ | **Calcul :** `groupby(atm_id).rolling(28).std()`<br>**Usage :** feature ML, anticipation variance |
+| `dmq_trend_7j` | Pente linéaire du DMQ sur 7 derniers jours | **Calcul :** `np.polyfit(range(7), dmq_7j, deg=1)[0]`<br>**Usage :** détecter tendances courtes |
+| `dmq_trend_28j` | Pente linéaire du DMQ sur 28 jours | **Calcul :** idem sur 28 j<br>**Usage :** tendance moyen terme |
+| `dmq_debut_mois_ratio` | `dmq_jour / dmq_moyen` | **Calcul :** ratio DMQ courant / moyenne ATM<br>**Usage :** caler l'effet « DMQ de début de mois » |
+| `volatilite_dmq` | Volatilité brute (source HFSQL) | **Source :** `DC_VolatiliteDmq` |
+
+### 🔸 **Configuration automate** (une ligne par ATM)
+
+| Nom dans le CSV | Description | Comment elle est obtenue |
+|-----------------|-------------|--------------------------|
+| `nb_cassettes_5` / `_10` / `_20` / `_50` / `_100` | Nombre de cassettes par coupure | **Source :** configuration ATM (HFSQL, à intégrer)<br>**Usage :** formule étape 2 `SEUIL_MAX × nb_cassettes` |
+| `nb_conteneurs` | Nombre de conteneurs Axytrans | **Usage :** cap étape 3 (2 600 billets × nb_conteneurs) |
+| `insurance_amount` | Assurance agence (€) | **Usage :** cap étape 6 (assurance agence) |
+| `mode_livraison` | `"axytrans"` ou autre | **Usage :** déclenche les caps Axytrans (étape 3) |
+| `mode_chargement` | `"clic-clac"` ou `"complement"` | **Usage :** sélection finale étape 5 (remplissage max vs complément) |
+| `soldes_ratio_assurance` | Ratio `Σ soldes × coupure / insurance_amount` | **Calcul :** `add_dmq_features()`<br>**Usage :** indicateur de remplissage |
+
+### 🔸 **Sortie du moteur de commande** (`commandes_predictives.csv`)
+
+Colonnes produites par `CommandPipeline.run()` et écrites dans
+`data/output/commandes_predictives.csv`.
+
+| Nom dans le CSV | Type | Description | Règle de calcul |
+|-----------------|------|-------------|-----------------|
+| `atm_id` | int | Identifiant de l'automate | Clé primaire |
+| `predictif_5` / `_10` / `_20` / `_50` / `_100` | int | Nombre de billets à commander par coupure | Étapes 2-6 du moteur (cf. `call_stack.md`) |
+| `k7hs_5..100` | bool | Cassette hors service ? | Étape 0 : solde inchangé ≥ 3 j sur 15 j observés |
+| **`is_command`** ⭐ | bool | **Commande existe-t-elle ?** | **`any(predictif_c > 0 for c in [5,10,20,50,100])`** |
+| `is_command_exceptionnelle` | bool | Commande exceptionnelle déclenchée | Étape 4 : solde soir < DMQ sur ≥ 1 coupure non-HS |
+| `alerte_risque_vide` | bool | Risque que l'ATM soit vide | Identique à la condition précédente (pré-autorisation) |
+| `alerte_commande_supprimee` | bool | Commande annulée (< seuil min) | Étape 3 ou 6 : montant < `CMD_MIN_AMOUNT` (2 000 €) |
+| `alerte_commande_precedente_non_chargee` | bool | Une `PendingCommand` a été fournie | Saisie via paramètre de `pipeline.run()` |
+| `montant_total` | int | Montant total de la commande (€) | `Σ predictif_c × c` |
+
+**⭐ Règle métier clé :** `is_command` = True si et seulement si **au moins
+une coupure** a un `predictif_c > 0`. Cette règle provient directement de la
+documentation PredikATM et est testée dans
+`tests/test_commande.py::TestCommandCalculator::test_is_command_rule_any_positive`.
+
+---
+
+## 🧪 **COMMANDES CLI QUI PRODUISENT CES COLONNES**
+
+| Étape | Commande | Colonnes produites |
+|-------|----------|--------------------|
+| Enrichissement | `python main.py --step enrichment` | Temporelles, lag, rolling, saisonnières, **DMQ features** (v1.1.0) |
+| CatBoost | `python main.py --step catboost` | Prédictions `amount` (montant agrégé) |
+| **Moteur commande** | `python main.py --step command --day-commande YYYY-MM-DD --day-livraison YYYY-MM-DD` | **`predictif_5..100`, `is_command`, alertes** |
+| Benchmark | `python tests/benchmark_dmq.py` | `data/output/precision_comparison.csv` (MAE/RMSE/MAPE par coupure) |

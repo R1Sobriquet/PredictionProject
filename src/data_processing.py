@@ -1,17 +1,16 @@
 """
-Module d'enrichissement des données de commandes.
+Module d'enrichissement des données de commandes ATM.
 
-Ce module implémente l'étape 1B du projet :
-- Enrichissement des données avec variables temporelles
-- Ajout de variables explicatives (jour semaine, weekend, etc.)
-- Calcul des quantités de la veille (lag features)
-- Analyse des patterns saisonniers
+Features ajoutées :
+1. Features temporelles (year, month, weekday, etc.)
+2. Features ATM historiques (days_since_last_order, avg_reload_frequency, etc.)
+3. Features ATM agrégées (total_soldes, total_k7hs, cassettes_actives, etc.)
+4. Features saisonnières (sin/cos cycliques, quarter, etc.)
 """
 
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
-from typing import Optional, Dict, List 
+from typing import Optional, Dict, List
 import logging
 from pathlib import Path
 
@@ -22,7 +21,17 @@ try:
         Messages,
         WEEKDAY_NAMES,
         WEEKEND_DAYS,
-        get_file_path
+        CASSETTE_COLUMNS,
+        AJUSTEMENT_COLUMNS,
+        SOLDES_COLUMNS,
+        K7HS_COLUMNS,
+        COUPURES,
+        SOLDES_BY_COUPURE,
+        DMQ_BY_COUPURE,
+        is_french_holiday,
+        is_eve_of_holiday,
+        is_payday,
+        get_file_path,
     )
 except ImportError:
     from src.utils import (
@@ -31,41 +40,41 @@ except ImportError:
         Messages,
         WEEKDAY_NAMES,
         WEEKEND_DAYS,
-        get_file_path
+        CASSETTE_COLUMNS,
+        AJUSTEMENT_COLUMNS,
+        SOLDES_COLUMNS,
+        K7HS_COLUMNS,
+        COUPURES,
+        SOLDES_BY_COUPURE,
+        DMQ_BY_COUPURE,
+        is_french_holiday,
+        is_eve_of_holiday,
+        is_payday,
+        get_file_path,
     )
 
-# Configuration du logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
 class DataEnrichmentPipeline:
     """
-    Pipeline d'enrichissement des données avec variables temporelles et saisonnières.
+    Pipeline d'enrichissement des données ATM.
 
-    Transforme les données nettoyées en dataset enrichi pour la modélisation.
+    Transforme les données nettoyées en dataset enrichi avec :
+    - Features temporelles
+    - Historique de rechargement par ATM
+    - Agrégats par coupure (soldes, ajustements, cassettes HS)
+    - Délais livraison/chargement
+    - Features saisonnières cycliques
     """
 
     def __init__(self, clean_data: Optional[pd.DataFrame] = None):
-        """
-        Initialise le pipeline d'enrichissement.
-
-        Args:
-            clean_data: Données nettoyées (si None, charge depuis le fichier)
-        """
         self.clean_data = clean_data
         self.enriched_data = None
 
     def load_clean_data(self, file_path: Optional[Path] = None) -> pd.DataFrame:
-        """
-        Charge les données nettoyées depuis un fichier.
-
-        Args:
-            file_path: Chemin du fichier (optionnel)
-
-        Returns:
-            DataFrame: Données nettoyées chargées
-        """
+        """Charge les données nettoyées depuis un fichier."""
         if self.clean_data is not None:
             return self.clean_data
 
@@ -78,311 +87,356 @@ class DataEnrichmentPipeline:
 
         self.clean_data = pd.read_csv(
             file_path,
-            parse_dates=[ColumnNames.DATE],
-            date_format='%Y-%m-%d'
+            parse_dates=[ColumnNames.ORDER_DATE],
+            date_format='%Y-%m-%d',
         )
 
-        logger.info(f"✅ {len(self.clean_data)} lignes chargées")
+        # Convertir les dates optionnelles
+        for date_col in [ColumnNames.DELIVERY_DATE, ColumnNames.LOADING_DATE]:
+            if date_col in self.clean_data.columns:
+                self.clean_data[date_col] = pd.to_datetime(
+                    self.clean_data[date_col], errors='coerce'
+                )
+
+        logger.info(f"{len(self.clean_data)} lignes chargées")
         return self.clean_data
 
     def add_temporal_features(self) -> pd.DataFrame:
         """
-        Ajoute les variables temporelles aux données.
+        Ajoute les variables temporelles basées sur order_date.
 
-        Variables ajoutées :
-        - year, month, day
-        - weekday (0=Lundi, 6=Dimanche)
-        - weekday_name
-        - is_weekend
-        - week_number
-
-        Returns:
-            DataFrame: Données avec variables temporelles
+        Variables : year, month, day, weekday, weekday_name, is_weekend, week_number
         """
-        logger.info("📅 Ajout des variables temporelles...")
+        logger.info("Ajout des variables temporelles...")
 
         if self.clean_data is None:
             self.load_clean_data()
 
-        # Copie des données pour éviter les modifications inattendues
         self.enriched_data = self.clean_data.copy()
 
-        # Variables temporelles de base
-        self.enriched_data[ColumnNames.YEAR] = self.enriched_data[ColumnNames.DATE].dt.year
-        self.enriched_data[ColumnNames.MONTH] = self.enriched_data[ColumnNames.DATE].dt.month
-        self.enriched_data[ColumnNames.DAY] = self.enriched_data[ColumnNames.DATE].dt.day
-
-        # Jour de la semaine (0=Lundi, 6=Dimanche)
-        self.enriched_data[ColumnNames.WEEKDAY] = self.enriched_data[ColumnNames.DATE].dt.weekday
-
-        # Nom du jour de la semaine
+        dt = self.enriched_data[ColumnNames.ORDER_DATE]
+        self.enriched_data[ColumnNames.YEAR] = dt.dt.year
+        self.enriched_data[ColumnNames.MONTH] = dt.dt.month
+        self.enriched_data[ColumnNames.DAY] = dt.dt.day
+        self.enriched_data[ColumnNames.WEEKDAY] = dt.dt.weekday
         self.enriched_data[ColumnNames.WEEKDAY_NAME] = self.enriched_data[ColumnNames.WEEKDAY].map(WEEKDAY_NAMES)
-
-        # Weekend (True/False)
         self.enriched_data[ColumnNames.IS_WEEKEND] = self.enriched_data[ColumnNames.WEEKDAY].isin(WEEKEND_DAYS)
+        self.enriched_data[ColumnNames.WEEK_NUMBER] = dt.dt.isocalendar().week
 
-        # Numéro de semaine dans l'année
-        self.enriched_data[ColumnNames.WEEK_NUMBER] = self.enriched_data[ColumnNames.DATE].dt.isocalendar().week
+        # Features calendrier FR (jours fériés + paie) — signaux forts pour la
+        # prévision (veille de férié = souvent pic, fins de mois = pics paie).
+        dates_py = dt.dt.date
+        self.enriched_data['is_holiday'] = dates_py.map(is_french_holiday).astype(bool)
+        self.enriched_data['is_eve_holiday'] = dates_py.map(is_eve_of_holiday).astype(bool)
+        self.enriched_data['is_payday'] = dates_py.map(is_payday).astype(bool)
 
-        logger.info("✅ Variables temporelles ajoutées")
-        logger.info(
-            f"   - Période : {self.enriched_data[ColumnNames.DATE].min().date()} à {self.enriched_data[ColumnNames.DATE].max().date()}")
-        logger.info(f"   - Jours uniques : {self.enriched_data[ColumnNames.DATE].nunique()}")
-
+        logger.info("Variables temporelles ajoutées")
         return self.enriched_data
 
-    def add_lag_features(self, lag_days: List[int] = [1]) -> pd.DataFrame:
+    def add_atm_history_features(self) -> pd.DataFrame:
         """
-        Ajoute les variables de retard (quantités des jours précédents).
+        Ajoute les features basées sur l'historique de rechargement de chaque ATM.
 
-        Args:
-            lag_days: Liste des décalages en jours (par défaut [1] = jour précédent)
-
-        Returns:
-            DataFrame: Données avec variables de retard
+        Features :
+        - days_since_last_order : jours depuis le dernier rechargement
+        - last_order_amount : montant du dernier rechargement
+        - avg_reload_frequency : fréquence moyenne de rechargement (jours)
+        - avg_order_amount : montant moyen historique
+        - std_order_amount : écart-type des montants
+        - order_count_last_30d : commandes sur les 30 derniers jours calendaires
         """
-        logger.info(f"⏮️ Ajout des variables de retard : {lag_days} jour(s)")
+        logger.info("Ajout des features historiques ATM...")
 
         if self.enriched_data is None:
-            raise ValueError("Les données doivent être enrichies d'abord")
+            raise ValueError("Exécutez add_temporal_features() d'abord")
 
-        # Tri des données par article et par date
-        self.enriched_data = self.enriched_data.sort_values([
-            ColumnNames.ARTICLE_ID,
-            ColumnNames.DATE
-        ]).reset_index(drop=True)
+        # Trier par ATM et date
+        self.enriched_data = self.enriched_data.sort_values(
+            [ColumnNames.ATM_ID, ColumnNames.ORDER_DATE]
+        ).reset_index(drop=True)
 
-        # Ajout des colonnes de retard pour chaque article
-        for lag in lag_days:
-            col_name = f"{ColumnNames.QUANTITY}_lag_{lag}"
+        # --- days_since_last_order ---
+        self.enriched_data[ColumnNames.DAYS_SINCE_LAST_ORDER] = (
+            self.enriched_data.groupby(ColumnNames.ATM_ID)[ColumnNames.ORDER_DATE]
+            .diff()
+            .dt.days
+            .fillna(0)
+            .astype(int)
+        )
 
-            # Calcul du lag par groupe d'article
-            self.enriched_data[col_name] = (
-                self.enriched_data
-                .groupby(ColumnNames.ARTICLE_ID)[ColumnNames.QUANTITY]
-                .shift(lag)
-                .fillna(0)  # Première valeur = 0 car pas de valeur précédente
+        # --- last_order_amount ---
+        self.enriched_data[ColumnNames.LAST_ORDER_AMOUNT] = (
+            self.enriched_data.groupby(ColumnNames.ATM_ID)[ColumnNames.AMOUNT]
+            .shift(1)
+            .fillna(0)
+        )
+
+        # --- avg_reload_frequency (expanding mean of days between orders) ---
+        self.enriched_data[ColumnNames.AVG_RELOAD_FREQUENCY] = (
+            self.enriched_data.groupby(ColumnNames.ATM_ID)[ColumnNames.DAYS_SINCE_LAST_ORDER]
+            .transform(lambda x: x.expanding().mean())
+            .round(2)
+        )
+
+        # --- avg_order_amount (expanding mean of amounts, excluding current) ---
+        self.enriched_data[ColumnNames.AVG_ORDER_AMOUNT] = (
+            self.enriched_data.groupby(ColumnNames.ATM_ID)[ColumnNames.AMOUNT]
+            .transform(lambda x: x.shift(1).expanding().mean())
+            .fillna(0)
+            .round(2)
+        )
+
+        # --- std_order_amount (expanding std, excluding current) ---
+        self.enriched_data[ColumnNames.STD_ORDER_AMOUNT] = (
+            self.enriched_data.groupby(ColumnNames.ATM_ID)[ColumnNames.AMOUNT]
+            .transform(lambda x: x.shift(1).expanding().std())
+            .fillna(0)
+            .round(2)
+        )
+
+        # --- order_count_last_30d ---
+        # Nombre de commandes pour cet ATM dans les 30 jours calendaires précédents
+        self.enriched_data[ColumnNames.ORDER_COUNT_LAST_30D] = 0
+
+        for atm_id in self.enriched_data[ColumnNames.ATM_ID].unique():
+            atm_mask = self.enriched_data[ColumnNames.ATM_ID] == atm_id
+            atm_dates = self.enriched_data.loc[atm_mask, ColumnNames.ORDER_DATE]
+
+            counts = []
+            for date in atm_dates:
+                window_start = date - pd.Timedelta(days=30)
+                count = ((atm_dates >= window_start) & (atm_dates < date)).sum()
+                counts.append(count)
+
+            self.enriched_data.loc[atm_mask, ColumnNames.ORDER_COUNT_LAST_30D] = counts
+
+        logger.info("Features historiques ATM ajoutées")
+        return self.enriched_data
+
+    def add_atm_data_features(self) -> pd.DataFrame:
+        """
+        Ajoute les features agrégées à partir des données ATM.
+
+        Features :
+        - total_soldes : somme des soldes par coupure
+        - total_ajustement : somme des ajustements par coupure
+        - total_k7hs : somme des cassettes hors service
+        - cassettes_actives : nombre de cassettes non nulles (1-5)
+        - delivery_delay : délai livraison en jours
+        - loading_delay : délai chargement en jours
+        """
+        logger.info("Ajout des features agrégées ATM...")
+
+        if self.enriched_data is None:
+            raise ValueError("Exécutez add_temporal_features() d'abord")
+
+        # Somme des soldes par coupure
+        existing_soldes = [c for c in SOLDES_COLUMNS if c in self.enriched_data.columns]
+        if existing_soldes:
+            self.enriched_data['total_soldes'] = self.enriched_data[existing_soldes].sum(axis=1)
+
+        # Somme des ajustements par coupure
+        existing_ajust = [c for c in AJUSTEMENT_COLUMNS if c in self.enriched_data.columns]
+        if existing_ajust:
+            self.enriched_data['total_ajustement'] = self.enriched_data[existing_ajust].sum(axis=1)
+
+        # Somme des cassettes hors service
+        existing_k7hs = [c for c in K7HS_COLUMNS if c in self.enriched_data.columns]
+        if existing_k7hs:
+            self.enriched_data['total_k7hs'] = self.enriched_data[existing_k7hs].sum(axis=1)
+
+        # Nombre de cassettes actives (non nulles) parmi les 5 cassettes
+        existing_cassettes = [c for c in CASSETTE_COLUMNS if c in self.enriched_data.columns]
+        if existing_cassettes:
+            self.enriched_data['cassettes_actives'] = (
+                self.enriched_data[existing_cassettes].gt(0).sum(axis=1)
+            )
+
+        # Délai de livraison (delivery_date - order_date)
+        if ColumnNames.DELIVERY_DATE in self.enriched_data.columns:
+            self.enriched_data['delivery_delay'] = (
+                (self.enriched_data[ColumnNames.DELIVERY_DATE] - self.enriched_data[ColumnNames.ORDER_DATE])
+                .dt.days
+                .fillna(0)
                 .astype(int)
             )
 
-        # Ajout de la colonne demandée dans le cahier des charges
-        if 1 in lag_days:
-            self.enriched_data[ColumnNames.QUANTITY_PREV_DAY] = self.enriched_data[f"{ColumnNames.QUANTITY}_lag_1"]
-
-        logger.info("✅ Variables de retard ajoutées")
-
-        return self.enriched_data
-
-    def add_rolling_features(self, windows: List[int] = [7, 30]) -> pd.DataFrame:
-        """
-        Ajoute des moyennes mobiles sur différentes fenêtres.
-
-        Args:
-            windows: Liste des fenêtres (en jours) pour les moyennes mobiles
-
-        Returns:
-            DataFrame: Données avec moyennes mobiles
-        """
-        logger.info(f"📊 Ajout des moyennes mobiles : {windows} jours")
-
-        if self.enriched_data is None:
-            raise ValueError("Les données doivent être enrichies d'abord")
-
-        for window in windows:
-            col_name = f"{ColumnNames.QUANTITY}_rolling_mean_{window}d"
-
-            # Calcul de la moyenne mobile par article
-            self.enriched_data[col_name] = (
-                self.enriched_data
-                .groupby(ColumnNames.ARTICLE_ID)[ColumnNames.QUANTITY]
-                .transform(lambda x: x.rolling(window=window, min_periods=1).mean())
-                .round(2)
+        # Délai de chargement (loading_date - order_date)
+        if ColumnNames.LOADING_DATE in self.enriched_data.columns:
+            self.enriched_data['loading_delay'] = (
+                (self.enriched_data[ColumnNames.LOADING_DATE] - self.enriched_data[ColumnNames.ORDER_DATE])
+                .dt.days
+                .fillna(0)
+                .astype(int)
             )
 
-        logger.info("✅ Moyennes mobiles ajoutées")
-
+        logger.info("Features agrégées ATM ajoutées")
         return self.enriched_data
-
-    def calculate_weekday_stats(self) -> pd.DataFrame:
-        """
-        Calcule les statistiques par jour de la semaine.
-
-        Returns:
-            DataFrame: Moyennes des ventes par jour de semaine
-        """
-        if self.enriched_data is None:
-            raise ValueError("Les données doivent être enrichies d'abord")
-
-        weekday_stats = (
-            self.enriched_data
-            .groupby([ColumnNames.WEEKDAY_NAME, ColumnNames.WEEKDAY])[ColumnNames.QUANTITY]
-            .agg(['mean', 'sum', 'count'])
-            .round(2)
-            .reset_index()
-            .sort_values(ColumnNames.WEEKDAY)
-        )
-
-        # Renommage des colonnes pour plus de clarté
-        weekday_stats.columns = ['jour_semaine', 'weekday_num', 'moyenne_quantite', 'total_quantite', 'nb_observations']
-
-        logger.info("📈 Statistiques par jour de semaine calculées")
-
-        return weekday_stats
-
-    def get_weekend_analysis(self) -> Dict:
-        """
-        Analyse comparative weekend vs semaine.
-
-        Returns:
-            dict: Statistiques weekend vs semaine
-        """
-        if self.enriched_data is None:
-            raise ValueError("Les données doivent être enrichies d'abord")
-
-        weekend_stats = self.enriched_data.groupby(ColumnNames.IS_WEEKEND)[ColumnNames.QUANTITY].agg(
-            ['mean', 'sum', 'count']).round(2)
-
-        analysis = {
-            'semaine': {
-                'moyenne': weekend_stats.loc[False, 'mean'],
-                'total': weekend_stats.loc[False, 'sum'],
-                'observations': weekend_stats.loc[False, 'count']
-            },
-            'weekend': {
-                'moyenne': weekend_stats.loc[True, 'mean'],
-                'total': weekend_stats.loc[True, 'sum'],
-                'observations': weekend_stats.loc[True, 'count']
-            }
-        }
-
-        # Ratio weekend/semaine
-        analysis['ratio_weekend_vs_semaine'] = round(
-            analysis['weekend']['moyenne'] / analysis['semaine']['moyenne'], 2
-        )
-
-        return analysis
 
     def add_seasonal_features(self) -> pd.DataFrame:
         """
         Ajoute des variables saisonnières avancées.
 
-        Returns:
-            DataFrame: Données avec variables saisonnières
+        Variables : day_of_year, quarter, is_month_start/middle/end,
+                    sin/cos cycliques (day_of_year, weekday)
         """
-        logger.info("🌍 Ajout des variables saisonnières...")
+        logger.info("Ajout des variables saisonnières...")
 
         if self.enriched_data is None:
-            raise ValueError("Les données doivent être enrichies d'abord")
+            raise ValueError("Exécutez add_temporal_features() d'abord")
 
-        # Jour de l'année (1-366)
-        self.enriched_data['day_of_year'] = self.enriched_data[ColumnNames.DATE].dt.dayofyear
+        self.enriched_data['day_of_year'] = self.enriched_data[ColumnNames.ORDER_DATE].dt.dayofyear
+        self.enriched_data['quarter'] = self.enriched_data[ColumnNames.ORDER_DATE].dt.quarter
 
-        # Trimestre
-        self.enriched_data['quarter'] = self.enriched_data[ColumnNames.DATE].dt.quarter
+        # Position dans le mois
+        day = self.enriched_data[ColumnNames.DAY]
+        self.enriched_data['is_month_start'] = day <= 5
+        self.enriched_data['is_month_middle'] = (day > 10) & (day <= 20)
+        self.enriched_data['is_month_end'] = day > 25
 
-        # Début/milieu/fin de mois
-        self.enriched_data['is_month_start'] = self.enriched_data[ColumnNames.DAY] <= 5
-        self.enriched_data['is_month_middle'] = (self.enriched_data[ColumnNames.DAY] > 10) & (
-                    self.enriched_data[ColumnNames.DAY] <= 20)
-        self.enriched_data['is_month_end'] = self.enriched_data[ColumnNames.DAY] > 25
-
-        # Variables cycliques (pour capturer la périodicité)
-        # Jour de l'année en sin/cos pour capturer la saisonnalité annuelle
+        # Encodage cyclique
         self.enriched_data['day_of_year_sin'] = np.sin(2 * np.pi * self.enriched_data['day_of_year'] / 365.25)
         self.enriched_data['day_of_year_cos'] = np.cos(2 * np.pi * self.enriched_data['day_of_year'] / 365.25)
-
-        # Jour de la semaine en sin/cos pour capturer la périodicité hebdomadaire
         self.enriched_data['weekday_sin'] = np.sin(2 * np.pi * self.enriched_data[ColumnNames.WEEKDAY] / 7)
         self.enriched_data['weekday_cos'] = np.cos(2 * np.pi * self.enriched_data[ColumnNames.WEEKDAY] / 7)
 
-        logger.info("✅ Variables saisonnières ajoutées")
-
+        logger.info("Variables saisonnières ajoutées")
         return self.enriched_data
 
-    def preview_enriched_data(self, n_rows: int = 10, article_id: Optional[int] = None) -> None:
-        """
-        Affiche un aperçu des données enrichies.
+    def add_dmq_features(self) -> pd.DataFrame:
+        """Ajoute des features issues du DMQ (signal de consommation).
 
-        Args:
-            n_rows: Nombre de lignes à afficher
-            article_id: ID d'article spécifique (optionnel)
+        Features :
+        - ``dmq_volatilite``           : écart-type glissant 28 j du montant.
+        - ``dmq_trend_7j``             : pente d'une régression linéaire sur les
+                                         7 dernières observations (par ATM).
+        - ``dmq_trend_28j``            : pente sur 28 j.
+        - ``dmq_debut_mois_ratio``     : amount_jour / moyenne_28j (via shift(1))
+        - ``soldes_ratio_total``       : total_soldes / montant_assurance si dispo
+
+        Note : ne nécessite pas l'ajout de colonnes cibles DMQ par coupure — ces
+        features sont des **signaux d'entrée** pour le modèle. Les DMQ par
+        coupure (``dmq_5/10/...``) sont produits séparément (voir config +
+        pipeline).
         """
+        logger.info("Ajout des features DMQ (volatilité + tendances)...")
+
         if self.enriched_data is None:
-            raise ValueError("Aucune donnée enrichie disponible")
+            raise ValueError("Exécutez add_temporal_features() d'abord")
 
-        data_to_show = self.enriched_data
+        df = self.enriched_data
+        gb = df.groupby(ColumnNames.ATM_ID)[ColumnNames.AMOUNT]
 
-        if article_id is not None:
-            data_to_show = data_to_show[data_to_show[ColumnNames.ARTICLE_ID] == article_id]
-            print(f"📋 Aperçu des données pour l'article {article_id} (premières {n_rows} lignes) :")
-        else:
-            print(f"📋 Aperçu des données enrichies (premières {n_rows} lignes) :")
+        # Volatilité (écart-type) des montants sur les 28 dernières commandes
+        df['dmq_volatilite'] = gb.transform(
+            lambda x: x.shift(1).rolling(window=28, min_periods=2).std()
+        ).fillna(0).round(2)
 
-        print("=" * 100)
+        # Pente (tendance) sur 7 et 28 jours via une régression linéaire simple
+        def _slope(series: pd.Series) -> float:
+            y = series.dropna().to_numpy(dtype=float)
+            if len(y) < 2:
+                return 0.0
+            x = np.arange(len(y), dtype=float)
+            # polyfit degré 1 : retourne [pente, intercept]
+            try:
+                slope = np.polyfit(x, y, 1)[0]
+            except (np.linalg.LinAlgError, ValueError):
+                return 0.0
+            return float(slope)
 
-        # Sélection des colonnes principales pour l'affichage
-        main_cols = [
-            ColumnNames.DATE,
-            ColumnNames.ARTICLE_ID,
-            ColumnNames.QUANTITY,
-            ColumnNames.WEEKDAY_NAME,
-            ColumnNames.IS_WEEKEND
-        ]
+        df['dmq_trend_7j'] = gb.transform(
+            lambda x: x.shift(1).rolling(window=7, min_periods=2).apply(_slope, raw=False)
+        ).fillna(0).round(2)
 
-        # Ajout de la colonne quantity_prev_day si elle existe
-        if ColumnNames.QUANTITY_PREV_DAY in data_to_show.columns:
-            main_cols.append(ColumnNames.QUANTITY_PREV_DAY)
+        df['dmq_trend_28j'] = gb.transform(
+            lambda x: x.shift(1).rolling(window=28, min_periods=2).apply(_slope, raw=False)
+        ).fillna(0).round(2)
 
-        display_data = data_to_show[main_cols].head(n_rows)
-        print(display_data.to_string(index=False))
+        # Ratio "amount du jour vs moyenne glissante" — signal début de mois
+        rolling_mean_28 = gb.transform(
+            lambda x: x.shift(1).rolling(window=28, min_periods=1).mean()
+        )
+        safe_mean = rolling_mean_28.replace(0, np.nan)
+        df['dmq_debut_mois_ratio'] = (df[ColumnNames.AMOUNT] / safe_mean).fillna(1.0).round(3)
 
-        print("=" * 100)
-        print(f"Total des colonnes disponibles : {len(self.enriched_data.columns)}")
-        print(
-            f"Nouvelles colonnes ajoutées : {[col for col in self.enriched_data.columns if col not in [ColumnNames.DATE, ColumnNames.ARTICLE_ID, ColumnNames.QUANTITY]]}")
+        # Ratio de remplissage des soldes (si colonnes dispo)
+        if 'total_soldes' in df.columns and ColumnNames.INSURANCE_AMOUNT in df.columns:
+            denom = df[ColumnNames.INSURANCE_AMOUNT].replace(0, np.nan)
+            df['soldes_ratio_assurance'] = (df['total_soldes'] / denom).fillna(0).round(3)
+
+        self.enriched_data = df
+        logger.info("Features DMQ ajoutées")
+        return self.enriched_data
+
+    def add_dmq_per_coupure_features(self) -> pd.DataFrame:
+        """Crée les colonnes ``dmq_<c>`` pour chaque coupure.
+
+        Définition : ``DMQ_<c>(t)`` = moyenne sur 28 jours glissants des
+        **baisses** quotidiennes de ``solde_<c>`` (consommation observée),
+        calculée par ATM. Un ``shift(1)`` est appliqué pour que la valeur à
+        la date t ne dépende que du passé strict (pas de leakage).
+
+        Ces colonnes sont produites comme **signaux d'entrée** pour le
+        ``CommandPipeline`` (cf. ``pipeline.py`` / ``_default_dmq_provider``)
+        et comme targets possibles pour ``CatBoostDmqForecaster``.
+        """
+        logger.info("Ajout des features DMQ par coupure (dmq_5..100)...")
+
+        if self.enriched_data is None:
+            raise ValueError("Exécutez add_temporal_features() d'abord")
+
+        df = self.enriched_data.sort_values(
+            [ColumnNames.ATM_ID, ColumnNames.ORDER_DATE]
+        ).reset_index(drop=True)
+
+        for c in COUPURES:
+            sol_col = SOLDES_BY_COUPURE[c]
+            dmq_col = DMQ_BY_COUPURE[c]
+
+            if sol_col not in df.columns:
+                logger.warning(
+                    f"  Colonne {sol_col} absente : {dmq_col} mis à 0.0"
+                )
+                df[dmq_col] = 0.0
+                continue
+
+            # Baisses quotidiennes = diff négative (clippée à 0)
+            diffs = df.groupby(ColumnNames.ATM_ID)[sol_col].diff()
+            baisses = (-diffs).clip(lower=0)
+
+            # Moyenne glissante 28j, shift(1) pour éviter toute fuite
+            df[dmq_col] = (
+                baisses.groupby(df[ColumnNames.ATM_ID])
+                .transform(
+                    lambda s: s.shift(1).rolling(window=28, min_periods=3).mean()
+                )
+                .fillna(0.0)
+                .round(2)
+            )
+
+        self.enriched_data = df
+        logger.info(f"  5 colonnes DMQ par coupure ajoutées : {list(DMQ_BY_COUPURE.values())}")
+        return self.enriched_data
 
     def save_enriched_data(self, output_path: Optional[Path] = None) -> Path:
-        """
-        Sauvegarde les données enrichies.
-
-        Args:
-            output_path: Chemin de sortie (optionnel)
-
-        Returns:
-            Path: Chemin du fichier sauvegardé
-        """
+        """Sauvegarde les données enrichies."""
         if self.enriched_data is None:
             raise ValueError("Aucune donnée enrichie à sauvegarder")
 
         output_path = output_path or get_file_path('enriched')
-
         self.enriched_data.to_csv(output_path, index=False, date_format='%Y-%m-%d')
-        logger.info(f"💾 Données enrichies sauvegardées : {output_path}")
-
+        logger.info(f"Données enrichies sauvegardées : {output_path}")
         return output_path
 
     def save_intermediate_snapshot(self, data: pd.DataFrame, stage_name: str) -> Path:
-        """
-        Sauvegarde un snapshot intermédiaire du pipeline d'enrichissement.
-
-        Args:
-            data: DataFrame à sauvegarder
-            stage_name: Nom de l'étape (ex: 'temporal', 'lag', 'rolling', etc.)
-
-        Returns:
-            Path: Chemin du fichier sauvegardé
-        """
-        # Créer le dossier snapshots s'il n'existe pas
+        """Sauvegarde un snapshot intermédiaire."""
         snapshot_dir = Path("data/snapshots")
         snapshot_dir.mkdir(parents=True, exist_ok=True)
 
-        # Nom du fichier
         snapshot_file = snapshot_dir / f"snapshot_enrichment_{stage_name}.csv"
-
-        # Sauvegarder
         data.to_csv(snapshot_file, index=False, date_format='%Y-%m-%d')
-        logger.info(f"   📸 Snapshot sauvegardé : {snapshot_file} ({len(data)} lignes)")
-
+        logger.info(f"  Snapshot sauvegardé : {snapshot_file} ({len(data)} lignes)")
         return snapshot_file
 
     def run_full_enrichment(self, save_output: bool = True, save_snapshots: bool = True) -> pd.DataFrame:
@@ -390,161 +444,142 @@ class DataEnrichmentPipeline:
         Exécute le pipeline complet d'enrichissement.
 
         Args:
-            save_output: Sauvegarde automatique du résultat final
-            save_snapshots: Sauvegarde des CSV intermédiaires à chaque étape
+            save_output: Sauvegarde du résultat final
+            save_snapshots: Sauvegarde des snapshots intermédiaires
 
         Returns:
-            DataFrame: Données enrichies complètes
+            DataFrame: Données enrichies
         """
-        logger.info("🚀 DÉBUT DU PIPELINE D'ENRICHISSEMENT")
+        logger.info("DÉBUT DU PIPELINE D'ENRICHISSEMENT ATM")
         logger.info("=" * 50)
-
-        if save_snapshots:
-            logger.info("📸 Mode snapshots activé - CSV intermédiaires seront sauvegardés")
 
         try:
             # ÉTAPE 1 : Chargement
-            logger.info("\n🔄 ÉTAPE 1 : Chargement des données nettoyées...")
+            logger.info("\nÉTAPE 1 : Chargement des données nettoyées...")
             self.load_clean_data()
             if save_snapshots:
                 self.save_intermediate_snapshot(self.clean_data, "01_loaded")
 
             # ÉTAPE 2 : Variables temporelles
-            logger.info("\n🔄 ÉTAPE 2: Ajout des variables temporelles...")
+            logger.info("\nÉTAPE 2 : Variables temporelles...")
             self.add_temporal_features()
             if save_snapshots:
                 self.save_intermediate_snapshot(self.enriched_data, "02_temporal")
 
-            # ÉTAPE 3 : Variables de retard
-            logger.info("\n🔄 ÉTAPE 3 : Ajout des variables de retard...")
-            self.add_lag_features(lag_days=[1, 7])
+            # ÉTAPE 3 : Historique ATM
+            logger.info("\nÉTAPE 3 : Features historiques ATM...")
+            self.add_atm_history_features()
             if save_snapshots:
-                self.save_intermediate_snapshot(self.enriched_data, "03_lag")
+                self.save_intermediate_snapshot(self.enriched_data, "03_atm_history")
 
-            # ÉTAPE 4 : Moyennes mobiles
-            logger.info("\n🔄 ÉTAPE 4 : Ajout des moyennes mobiles...")
-            self.add_rolling_features(windows=[7, 30])
+            # ÉTAPE 4 : Features agrégées ATM
+            logger.info("\nÉTAPE 4 : Features agrégées ATM...")
+            self.add_atm_data_features()
             if save_snapshots:
-                self.save_intermediate_snapshot(self.enriched_data, "04_rolling")
+                self.save_intermediate_snapshot(self.enriched_data, "04_atm_data")
 
             # ÉTAPE 5 : Variables saisonnières
-            logger.info("\n🔄 ÉTAPE 5 : Ajout des variables saisonnières...")
+            logger.info("\nÉTAPE 5 : Variables saisonnières...")
             self.add_seasonal_features()
             if save_snapshots:
                 self.save_intermediate_snapshot(self.enriched_data, "05_seasonal")
 
-            # ÉTAPE 6 : Sauvegarde finale
+            # ÉTAPE 5b : Features DMQ (volatilité, tendance, ratios)
+            logger.info("\nÉTAPE 5b : Features DMQ...")
+            self.add_dmq_features()
+            if save_snapshots:
+                self.save_intermediate_snapshot(self.enriched_data, "05b_dmq")
+
+            # ÉTAPE 5c : DMQ par coupure (dmq_5..100)
+            logger.info("\nÉTAPE 5c : Features DMQ par coupure...")
+            self.add_dmq_per_coupure_features()
+            if save_snapshots:
+                self.save_intermediate_snapshot(self.enriched_data, "05c_dmq_per_coupure")
+
+            # ÉTAPE 6 : Sauvegarde
             if save_output:
-                logger.info("\n🔄 ÉTAPE 6 : Sauvegarde finale...")
+                logger.info("\nÉTAPE 6 : Sauvegarde finale...")
                 self.save_enriched_data()
 
             logger.info("=" * 50)
-            logger.info("✅ PIPELINE D'ENRICHISSEMENT TERMINÉ AVEC SUCCÈS")
-            logger.info(f"   📊 {len(self.enriched_data)} lignes enrichies")
-            logger.info(f"   📈 {len(self.enriched_data.columns)} colonnes au total")
-
-            if save_snapshots:
-                logger.info("📸 Snapshots disponibles dans : data/snapshots/")
+            logger.info("PIPELINE D'ENRICHISSEMENT TERMINÉ")
+            logger.info(f"  {len(self.enriched_data)} lignes enrichies")
+            logger.info(f"  {len(self.enriched_data.columns)} colonnes au total")
 
             return self.enriched_data
 
         except Exception as e:
-            logger.error(f"❌ ERREUR DANS LE PIPELINE : {e}")
+            logger.error(f"ERREUR DANS LE PIPELINE : {e}")
             raise
 
     def get_enrichment_summary(self) -> Dict:
-        """
-        Retourne un résumé des données enrichies.
-
-        Returns:
-            dict: Statistiques et informations sur l'enrichissement
-        """
+        """Retourne un résumé des données enrichies."""
         if self.enriched_data is None:
             return {"error": "Aucune donnée enrichie disponible"}
 
-        # Statistiques générales
-        summary = {
+        return {
             "total_lignes": len(self.enriched_data),
             "total_colonnes": len(self.enriched_data.columns),
-            "articles_uniques": self.enriched_data[ColumnNames.ARTICLE_ID].nunique(),
+            "atms_uniques": self.enriched_data[ColumnNames.ATM_ID].nunique(),
             "periode": {
-                "debut": self.enriched_data[ColumnNames.DATE].min(),
-                "fin": self.enriched_data[ColumnNames.DATE].max(),
-                "nb_jours": self.enriched_data[ColumnNames.DATE].nunique()
-            }
+                "debut": self.enriched_data[ColumnNames.ORDER_DATE].min(),
+                "fin": self.enriched_data[ColumnNames.ORDER_DATE].max(),
+                "nb_jours": self.enriched_data[ColumnNames.ORDER_DATE].nunique(),
+            },
+            "montant_moyen": self.enriched_data[ColumnNames.AMOUNT].mean(),
+            "montant_total": self.enriched_data[ColumnNames.AMOUNT].sum(),
         }
-
-        # Analyse par jour de semaine
-        weekday_stats = self.calculate_weekday_stats()
-        summary["jour_plus_fort"] = weekday_stats.loc[weekday_stats['moyenne_quantite'].idxmax(), 'jour_semaine']
-        summary["moyenne_par_jour"] = weekday_stats[['jour_semaine', 'moyenne_quantite']].to_dict('records')
-
-        # Analyse weekend
-        summary["analyse_weekend"] = self.get_weekend_analysis()
-
-        return summary
 
 
 # ===== FONCTIONS UTILITAIRES =====
 
-def quick_enrichment(clean_data_path: str) -> pd.DataFrame:
-    """
-    Fonction rapide pour l'enrichissement complet des données.
-
-    Args:
-        clean_data_path: Chemin vers les données nettoyées
-
-    Returns:
-        DataFrame: Données enrichies
-    """
+def quick_enrichment(clean_data_path: str = None) -> pd.DataFrame:
+    """Fonction rapide pour l'enrichissement complet."""
     pipeline = DataEnrichmentPipeline()
     return pipeline.run_full_enrichment()
 
 
-def analyze_article_pattern(enriched_data: pd.DataFrame, article_id: int) -> Dict:
+def analyze_atm_pattern(enriched_data: pd.DataFrame, atm_id: int) -> Dict:
     """
-    Analyse les patterns d'un article spécifique.
+    Analyse les patterns d'un ATM spécifique.
 
     Args:
         enriched_data: Données enrichies
-        article_id: ID de l'article à analyser
+        atm_id: ID de l'ATM à analyser
 
     Returns:
-        dict: Analyse des patterns de l'article
+        dict: Analyse des patterns de l'ATM
     """
-    article_data = enriched_data[enriched_data[ColumnNames.ARTICLE_ID] == article_id].copy()
+    atm_data = enriched_data[enriched_data[ColumnNames.ATM_ID] == atm_id].copy()
 
-    if article_data.empty:
-        return {"error": f"Article {article_id} non trouvé"}
+    if atm_data.empty:
+        return {"error": f"ATM {atm_id} non trouvé"}
 
-    # Statistiques par jour de semaine pour cet article
-    weekday_stats = article_data.groupby(ColumnNames.WEEKDAY_NAME)[ColumnNames.QUANTITY].agg(
-        ['mean', 'sum', 'std']).round(2)
+    weekday_stats = atm_data.groupby(ColumnNames.WEEKDAY_NAME)[ColumnNames.AMOUNT].agg(
+        ['mean', 'sum', 'std']
+    ).round(2)
 
     return {
-        "article_id": article_id,
-        "total_commandes": article_data[ColumnNames.QUANTITY].sum(),
-        "moyenne_quotidienne": article_data[ColumnNames.QUANTITY].mean(),
-        "jours_avec_commandes": (article_data[ColumnNames.QUANTITY] > 0).sum(),
-        "jour_plus_fort": weekday_stats['mean'].idxmax(),
-        "stats_par_jour": weekday_stats.to_dict('index')
+        "atm_id": atm_id,
+        "total_commandes": len(atm_data),
+        "montant_total": atm_data[ColumnNames.AMOUNT].sum(),
+        "montant_moyen": atm_data[ColumnNames.AMOUNT].mean(),
+        "frequence_moyenne_jours": atm_data[ColumnNames.DAYS_SINCE_LAST_ORDER].mean()
+            if ColumnNames.DAYS_SINCE_LAST_ORDER in atm_data.columns else None,
+        "jour_plus_fort": weekday_stats['mean'].idxmax() if not weekday_stats.empty else None,
+        "stats_par_jour": weekday_stats.to_dict('index'),
     }
 
 
 if __name__ == "__main__":
-    # Test du pipeline si exécuté directement
     pipeline = DataEnrichmentPipeline()
     try:
         data = pipeline.run_full_enrichment()
         summary = pipeline.get_enrichment_summary()
 
-        print("\n📊 RÉSUMÉ DE L'ENRICHISSEMENT :")
-        print(f"📈 Jour le plus fort : {summary.get('jour_plus_fort', 'Non calculé')}")
-        print(
-            f"🎯 Ratio weekend/semaine : {summary.get('analyse_weekend', {}).get('ratio_weekend_vs_semaine', 'Non calculé')}")
-
-        # Aperçu des données
-        pipeline.preview_enriched_data(n_rows=10)
+        print("\nRÉSUMÉ DE L'ENRICHISSEMENT :")
+        for key, value in summary.items():
+            print(f"  {key}: {value}")
 
     except Exception as e:
         print(f"Erreur : {e}")
