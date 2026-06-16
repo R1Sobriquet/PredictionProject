@@ -377,39 +377,27 @@ def run_catboost_dmq_step(preset: str = 'default') -> bool:
 
         predictions = {}
         actuals = {}
+        atm_arr = test_data[ColumnNames.ATM_ID].to_numpy()
+        date_arr = test_data[ColumnNames.ORDER_DATE].to_numpy()
         for c in COUPURES:
             dmq_col = DMQ_BY_COUPURE[c]
-            y_true_list = []
-            y_pred_list = []
+            y_true = test_data[dmq_col].to_numpy(dtype=float)
 
-            # Coupure sans variance : prédicteur constant
+            # Coupure sans variance : prédicteur constant ; sinon batch vectorisé
             is_constant = c in mcf.constant_predictions
-            const_val = mcf.constant_predictions.get(c, 0.0)
+            if is_constant:
+                y_pred = np.full(
+                    len(test_data), max(0.0, mcf.constant_predictions.get(c, 0.0))
+                )
+            else:
+                y_pred = mcf.models[c].predict_batch(
+                    atm_arr, date_arr, context_data=train_data, horizon=1,
+                )
 
-            for atm_id in test_data[ColumnNames.ATM_ID].unique():
-                atm_test = test_data[test_data[ColumnNames.ATM_ID] == atm_id]
-                for _, row in atm_test.iterrows():
-                    pred_date = row[ColumnNames.ORDER_DATE]
-                    if is_constant:
-                        pred = const_val
-                    else:
-                        try:
-                            pred = mcf.models[c].predict(
-                                atm_id=int(atm_id),
-                                prediction_dates=[pred_date],
-                                context_data=train_data,
-                                horizon=1,
-                            )[0]
-                        except Exception:
-                            continue
-                    y_pred_list.append(float(max(0.0, pred)))
-                    y_true_list.append(float(row[dmq_col]))
-
-            if y_pred_list:
-                predictions[c] = np.array(y_pred_list)
-                actuals[c] = np.array(y_true_list)
-                tag = " (constant)" if is_constant else ""
-                logger.info(f"  Coupure {c:>3}€ : {len(y_pred_list)} prédictions{tag}")
+            predictions[c] = y_pred
+            actuals[c] = y_true
+            tag = " (constant)" if is_constant else ""
+            logger.info(f"  Coupure {c:>3}€ : {len(y_pred)} prédictions{tag}")
 
         results_df = evaluate_per_coupure(predictions, actuals)
 
