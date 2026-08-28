@@ -148,7 +148,7 @@ class TestK7HSDetector:
 
 
 # ==========================================================================
-# Étape 1 — Simulation du solde au chargement
+# Étape 1 — Simulation du solde au chargement 1442
 # ==========================================================================
 
 

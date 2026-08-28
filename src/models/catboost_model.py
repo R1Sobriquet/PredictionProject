@@ -80,7 +80,7 @@ class CatBoostForecaster(BaselineModel):
         self,
         max_horizon: int = 90,
         iterations: int = 4000,
-        learning_rate: float = 0.03,
+        learning_rate: float = 0.04,
         depth: int = 6,
         early_stopping_rounds: int = 100,
         random_state: int = 42,
